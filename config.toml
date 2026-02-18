@@ -12,3 +12,7 @@ default_ttl_seconds = 60
 max_body_size_bytes = 1048576
 eviction_policy = "sieve"
 comparison_policy = "lru"
+
+[resp]
+enabled = true
+listen_addr = "127.0.0.1:6379"

@@ -1,4 +1,5 @@
 use crate::cache_layer::{parse_cache_control, CacheLayer};
+use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
@@ -7,14 +8,11 @@ use hyper_util::client::legacy::Client;
 use std::sync::Arc;
 use std::time::Instant;
 
-pub type HttpClient = Client<
-    hyper_util::client::legacy::connect::HttpConnector,
-    Body,
->;
+pub type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
 
 /// Shared application state passed to all handlers.
 pub struct AppState {
-    pub cache: CacheLayer,
+    pub cache: ArcSwap<CacheLayer>,
     pub client: HttpClient,
     pub upstream_url: String,
 }
@@ -33,11 +31,13 @@ pub async fn proxy_handler(
 
     let cache_key = format!("{}:{}", method, uri);
 
+    let cache = state.cache.load();
+
     // Check cache for GET requests
     if cacheable_method {
-        let lookup = state.cache.get(&cache_key);
+        let lookup = cache.get(&cache_key);
         if lookup.is_hit() {
-            let cached = lookup.value.unwrap();
+            let cached = lookup.value.unwrap(); // safe: guarded by is_hit()
             let elapsed = start.elapsed();
 
             tracing::debug!(
@@ -46,7 +46,7 @@ pub async fn proxy_handler(
                 "cache HIT"
             );
 
-            return build_cached_response(&cached, &state, true);
+            return build_cached_response(&cached, &cache, true);
         }
     }
 
@@ -101,7 +101,7 @@ pub async fn proxy_handler(
     // Determine if we should cache this response
     let should_cache = cacheable_method
         && status == StatusCode::OK
-        && body_bytes.len() <= state.cache.max_body_size
+        && body_bytes.len() <= cache.max_body_size
         && is_cacheable_headers(&headers);
 
     let ttl = extract_ttl(&headers);
@@ -113,11 +113,9 @@ pub async fn proxy_handler(
             .collect();
 
         let cached_response =
-            state
-                .cache
-                .build_response(status.as_u16(), response_headers, body_bytes.clone(), ttl);
+            cache.build_response(status.as_u16(), response_headers, body_bytes.clone(), ttl);
 
-        state.cache.insert(cache_key.clone(), cached_response);
+        cache.insert(cache_key.clone(), cached_response);
     }
 
     let elapsed = start.elapsed();
@@ -145,10 +143,10 @@ pub async fn proxy_handler(
     // Add cache status headers
     response = response
         .header("X-Cache", "MISS")
-        .header("X-Cache-Policy", state.cache.primary_name())
+        .header("X-Cache-Policy", cache.primary_name())
         .header(
             "X-Mode",
-            if state.cache.is_demo_mode() {
+            if cache.is_demo_mode() {
                 "demo"
             } else {
                 "bench"
@@ -161,7 +159,7 @@ pub async fn proxy_handler(
 /// Build an HTTP response from a cached entry.
 fn build_cached_response(
     cached: &colander_cache::traits::CachedResponse,
-    state: &AppState,
+    cache: &CacheLayer,
     _hit: bool,
 ) -> Response<Body> {
     let mut response = Response::builder().status(cached.status);
@@ -174,10 +172,10 @@ fn build_cached_response(
 
     response = response
         .header("X-Cache", "HIT")
-        .header("X-Cache-Policy", state.cache.primary_name())
+        .header("X-Cache-Policy", cache.primary_name())
         .header(
             "X-Mode",
-            if state.cache.is_demo_mode() {
+            if cache.is_demo_mode() {
                 "demo"
             } else {
                 "bench"

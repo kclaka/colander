@@ -1,4 +1,4 @@
-use crate::arena::{Arena, NIL, Node};
+use crate::arena::{Arena, Node, NIL};
 use crate::traits::{CachePolicy, CacheStats, CachedResponse};
 use std::collections::HashMap;
 use std::sync::Arc;

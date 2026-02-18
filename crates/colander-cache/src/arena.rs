@@ -1,6 +1,6 @@
 use crate::traits::CachedResponse;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Sentinel value indicating "no node" (null pointer equivalent).
 pub const NIL: u32 = u32::MAX;
