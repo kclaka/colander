@@ -1,0 +1,15 @@
+# Docker-specific config — uses container hostnames
+[server]
+listen_addr = "0.0.0.0:8080"
+metrics_addr = "0.0.0.0:9090"
+
+[upstream]
+url = "http://backend:3000"
+timeout_ms = 5000
+
+[cache]
+capacity = 10000
+default_ttl_seconds = 60
+max_body_size_bytes = 1048576
+eviction_policy = "sieve"
+comparison_policy = "lru"
