@@ -1,0 +1,24 @@
+[package]
+name = "proxy-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+colander-cache = { path = "../colander-cache" }
+tokio = { workspace = true }
+axum = { workspace = true }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+http-body-util = "0.1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+toml = "0.8"
+hdrhistogram = "7"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
