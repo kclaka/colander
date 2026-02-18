@@ -5,7 +5,7 @@ use colander_cache::sieve::SieveCache;
 use colander_cache::traits::{CacheStats, CachedResponse};
 
 use bytes::Bytes;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,14 @@ impl CacheInner {
             CacheInner::Sieve(c) => c.insert(key, value),
             CacheInner::Lru(c) => c.insert(key, value),
             CacheInner::Fifo(c) => c.insert(key, value),
+        }
+    }
+
+    fn remove(&self, key: &str) -> bool {
+        match self {
+            CacheInner::Sieve(c) => c.remove(key),
+            CacheInner::Lru(c) => c.remove(key),
+            CacheInner::Fifo(c) => c.remove(key),
         }
     }
 
@@ -76,7 +84,7 @@ pub struct CacheLayer {
     primary: CacheInner,
     comparison: Option<CacheInner>,
     demo_mode: AtomicBool,
-    pub default_ttl: Duration,
+    default_ttl_secs: AtomicU64,
     pub max_body_size: usize,
 }
 
@@ -102,9 +110,19 @@ impl CacheLayer {
             primary,
             comparison,
             demo_mode: AtomicBool::new(true),
-            default_ttl,
+            default_ttl_secs: AtomicU64::new(default_ttl.as_secs()),
             max_body_size,
         }
+    }
+
+    /// Current default TTL (read atomically for hot-reload support).
+    pub fn default_ttl(&self) -> Duration {
+        Duration::from_secs(self.default_ttl_secs.load(Ordering::Relaxed))
+    }
+
+    /// Update the default TTL atomically (no cache data loss).
+    pub fn set_default_ttl(&self, secs: u64) {
+        self.default_ttl_secs.store(secs, Ordering::Relaxed);
     }
 
     /// Look up a key in the primary cache. In demo mode, also checks the
@@ -138,6 +156,30 @@ impl CacheLayer {
         self.primary.insert(key, value);
     }
 
+    /// Remove a key from the primary cache. Returns true if the key existed.
+    pub fn remove(&self, key: &str) -> bool {
+        self.primary.remove(key)
+    }
+
+    /// Insert raw bytes (for RESP SET — bypasses HTTP response wrapping).
+    /// Only inserts into primary (RESP ops don't participate in demo comparison).
+    pub fn insert_raw(&self, key: String, value: Bytes, ttl: Option<Duration>) {
+        let response = CachedResponse {
+            status: 0,
+            headers: vec![],
+            body: value,
+            inserted_at: Instant::now(),
+            ttl: ttl.unwrap_or(self.default_ttl()),
+        };
+        self.primary.insert(key, response);
+    }
+
+    /// Get TTL remaining for a key. Returns None if key missing/expired.
+    pub fn ttl_remaining(&self, key: &str) -> Option<Duration> {
+        let entry = self.primary.get(key)?;
+        entry.ttl.checked_sub(entry.inserted_at.elapsed())
+    }
+
     /// Build a CachedResponse from raw HTTP response parts.
     pub fn build_response(
         &self,
@@ -151,7 +193,7 @@ impl CacheLayer {
             headers,
             body,
             inserted_at: Instant::now(),
-            ttl: ttl.unwrap_or(self.default_ttl),
+            ttl: ttl.unwrap_or(self.default_ttl()),
         }
     }
 
@@ -176,7 +218,8 @@ impl CacheLayer {
     }
 
     pub fn set_mode(&self, mode: CacheMode) {
-        self.demo_mode.store(mode == CacheMode::Demo, Ordering::Relaxed);
+        self.demo_mode
+            .store(mode == CacheMode::Demo, Ordering::Relaxed);
         tracing::info!(?mode, "cache mode changed");
     }
 

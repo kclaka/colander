@@ -90,8 +90,9 @@ pub async fn metrics_broadcaster(
     loop {
         interval.tick().await;
 
-        let primary = PolicyMetrics::from_cache(&state.cache, true).unwrap();
-        let comparison = PolicyMetrics::from_cache(&state.cache, false);
+        let cache = state.cache.load();
+        let primary = PolicyMetrics::from_cache(&cache, true).unwrap(); // primary always Some
+        let comparison = PolicyMetrics::from_cache(&cache, false);
 
         let current_total = primary.hits + primary.misses;
         let delta = current_total.saturating_sub(prev_total_requests);
@@ -101,14 +102,14 @@ pub async fn metrics_broadcaster(
         let snapshot = MetricsSnapshot {
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap() // safe: clock is after 1970
                 .as_millis(),
             window_ms: 500,
             primary,
             comparison,
             throughput_rps: throughput,
             uptime_seconds: start_time.elapsed().as_secs(),
-            mode: format!("{:?}", state.cache.mode()).to_lowercase(),
+            mode: format!("{:?}", cache.mode()).to_lowercase(),
         };
 
         // Ignore send errors (no subscribers)
@@ -160,12 +161,14 @@ pub async fn set_mode_handler(
         other => {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("unknown mode: {other}, use 'demo' or 'bench'")})),
+                Json(
+                    serde_json::json!({"error": format!("unknown mode: {other}, use 'demo' or 'bench'")}),
+                ),
             );
         }
     };
 
-    state.app.cache.set_mode(mode);
+    state.app.cache.load().set_mode(mode);
 
     (
         axum::http::StatusCode::OK,
@@ -175,12 +178,13 @@ pub async fn set_mode_handler(
 
 /// GET /api/stats — one-shot stats endpoint.
 pub async fn stats_handler(State(state): State<MetricsState>) -> impl IntoResponse {
-    let primary = PolicyMetrics::from_cache(&state.app.cache, true);
-    let comparison = PolicyMetrics::from_cache(&state.app.cache, false);
+    let cache = state.app.cache.load();
+    let primary = PolicyMetrics::from_cache(&cache, true);
+    let comparison = PolicyMetrics::from_cache(&cache, false);
 
     Json(serde_json::json!({
         "primary": primary,
         "comparison": comparison,
-        "mode": format!("{:?}", state.app.cache.mode()).to_lowercase(),
+        "mode": format!("{:?}", cache.mode()).to_lowercase(),
     }))
 }

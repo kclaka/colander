@@ -174,11 +174,7 @@ mod tests {
         assert_eq!(cache.len(), 200);
 
         // Verify at least some shards have entries (not all in one shard)
-        let nonempty_shards = cache
-            .shards
-            .iter()
-            .filter(|s| s.read().len() > 0)
-            .count();
+        let nonempty_shards = cache.shards.iter().filter(|s| s.read().len() > 0).count();
         assert!(
             nonempty_shards > 1,
             "expected keys distributed across multiple shards, got {}",

@@ -20,6 +20,6 @@ impl ZipfianGenerator {
     /// Generate the next item ID (1-based).
     pub fn next_id(&mut self) -> u64 {
         let mut rng = rand::thread_rng();
-        rng.sample(&self.dist) as u64
+        rng.sample(self.dist) as u64
     }
 }

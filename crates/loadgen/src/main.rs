@@ -215,9 +215,9 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind control server to {control_addr}: {e}"));
 
     tokio::spawn(async move {
-        axum::serve(control_listener, control_router)
-            .await
-            .unwrap();
+        if let Err(e) = axum::serve(control_listener, control_router).await {
+            tracing::error!(error = %e, "control server error");
+        }
     });
 
     // Build HTTP client for proxy requests
