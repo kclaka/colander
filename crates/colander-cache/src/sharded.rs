@@ -46,6 +46,11 @@ impl<T: CachePolicy> ShardedCache<T> {
         self.shards[idx].write().get(key)
     }
 
+    /// Inspect without counting another request or updating eviction policy state.
+    pub fn peek(&self, key: &str) -> Option<Arc<CachedResponse>> {
+        self.shards[self.shard_index(key)].read().peek(key)
+    }
+
     /// Insert a key-value pair. Takes a write lock on one shard.
     pub fn insert(&self, key: String, value: CachedResponse) {
         let idx = self.shard_index(&key);

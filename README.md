@@ -261,12 +261,18 @@ curl http://localhost:9090/metrics
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `colander_cache_hits_total` | counter | `policy` | Total cache hits |
-| `colander_cache_misses_total` | counter | `policy` | Total cache misses |
-| `colander_cache_keys` | gauge | `policy` | Current number of cached entries |
-| `colander_cache_evictions_total` | gauge | `policy` | Total evictions |
-| `colander_request_duration_seconds` | histogram | — | End-to-end request latency |
-| `colander_upstream_duration_seconds` | histogram | — | Upstream (origin) latency on cache misses |
+| `colander_cache_hits_total` | counter | `policy`, `role` | Observed cache hits |
+| `colander_cache_misses_total` | counter | `policy`, `role` | Observed cache misses |
+| `colander_cache_keys` | gauge | `policy`, `role` | Current cached entries |
+| `colander_cache_capacity` | gauge | `policy`, `role` | Configured cache slots |
+| `colander_cache_evictions_total` | counter | `policy`, `role` | Observed evictions |
+| `colander_cache_lookups_per_second` | gauge | — | Primary cache lookups per second |
+
+Metrics are sampled every 500 ms. `role` distinguishes the primary and comparison
+caches, including when both use the same policy. Counters remain monotonic when a
+cache is replaced; increments that occur entirely between the last sample and a
+replacement cannot be observed. Dashboard throughput measures primary cache lookups,
+not requests that bypass the cache. Latency histograms are not currently exported.
 
 ### Grafana
 

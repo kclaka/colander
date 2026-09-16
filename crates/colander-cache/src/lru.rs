@@ -34,6 +34,12 @@ impl LruCache {
 }
 
 impl CachePolicy for LruCache {
+    fn peek(&self, key: &str) -> Option<Arc<CachedResponse>> {
+        let index = *self.map.get(key)?;
+        let node = self.arena.get(index)?;
+        (!node.value.is_expired()).then(|| Arc::clone(&node.value))
+    }
+
     fn get(&mut self, key: &str) -> Option<Arc<CachedResponse>> {
         if let Some(&index) = self.map.get(key) {
             let node = self.arena.get(index).unwrap();
