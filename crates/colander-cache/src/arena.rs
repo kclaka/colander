@@ -59,6 +59,10 @@ pub struct Arena {
 impl Arena {
     /// Create a new arena pre-allocated for `capacity` nodes.
     pub fn new(capacity: usize) -> Self {
+        assert!(
+            capacity <= NIL as usize,
+            "arena capacity exceeds index range"
+        );
         let mut slots = Vec::with_capacity(capacity);
         // Pre-allocate all slots as None
         for _ in 0..capacity {
@@ -128,7 +132,7 @@ impl Arena {
 
     /// Remove a node from the list and return it. The slot is reclaimed.
     pub fn remove(&mut self, index: u32) -> Option<Node> {
-        let node = self.slots[index as usize].take()?;
+        let node = self.slots.get_mut(index as usize)?.take()?;
 
         // Unlink from list
         let prev = node.prev;
@@ -217,6 +221,20 @@ mod tests {
 
     fn test_node(key: &str) -> Node {
         Node::new(key.to_string(), test_response())
+    }
+
+    #[test]
+    fn removing_invalid_or_vacant_slot_is_safe() {
+        let mut arena = Arena::new(1);
+        assert!(arena.remove(NIL).is_none());
+        assert!(arena.remove(0).is_none());
+        assert_eq!(arena.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "arena capacity exceeds index range")]
+    fn rejects_unrepresentable_capacity_before_allocation() {
+        Arena::new(NIL as usize + 1);
     }
 
     #[test]

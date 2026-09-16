@@ -1,77 +1,61 @@
 use crate::traits::{CachePolicy, CacheStats, CachedResponse};
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-/// Number of shards. Must be a power of two for fast modulo via bitmask.
+/// Maximum number of independent shards.
 const NUM_SHARDS: usize = 64;
-const SHARD_MASK: u64 = (NUM_SHARDS as u64) - 1;
 
-/// Thread-safe sharded cache wrapper.
-///
-/// Distributes keys across 64 independent shards, each with its own `RwLock`
-/// and cache instance. This dramatically reduces lock contention:
-///
-/// - **SIEVE hits**: `read lock` on one shard → flip visited bit → release.
-///   63 other shards remain uncontested.
-/// - **SIEVE misses**: `write lock` on one shard → evict + insert → release.
-/// - **LRU hits**: `write lock` on one shard (move-to-front). This is the
-///   scalability bottleneck that SIEVE avoids.
-///
-/// Shard selection uses `ahash` for fast, DoS-resistant hashing.
+/// Thread-safe sharded cache wrapper. All policy lookups currently acquire a
+/// write lock because the common policy API updates statistics and expires entries.
+/// A process-wide random hash seed keeps policy comparisons on the same shards
+/// without exposing a fixed, predictable mapping to clients.
 pub struct ShardedCache<T: CachePolicy> {
-    shards: Box<[RwLock<T>; NUM_SHARDS]>,
+    shards: Box<[RwLock<T>]>,
     name: &'static str,
 }
 
 impl<T: CachePolicy> ShardedCache<T> {
-    /// Create a new sharded cache. `make_shard` is called 64 times with
-    /// the per-shard capacity (total_capacity / 64, minimum 1).
+    /// Create up to 64 shards, distributing every requested slot exactly once.
+    /// Panics for zero capacity, like the underlying cache policies.
     pub fn new<F>(total_capacity: usize, make_shard: F) -> Self
     where
         F: Fn(usize) -> T,
     {
-        let per_shard = (total_capacity / NUM_SHARDS).max(1);
-        let shards: Vec<RwLock<T>> = (0..NUM_SHARDS)
-            .map(|_| RwLock::new(make_shard(per_shard)))
+        assert!(total_capacity > 0, "cache capacity must be > 0");
+        let count = total_capacity.min(NUM_SHARDS);
+        let shards: Box<[RwLock<T>]> = (0..count)
+            .map(|index| {
+                let capacity = total_capacity / count + usize::from(index < total_capacity % count);
+                RwLock::new(make_shard(capacity))
+            })
             .collect();
-
         let name = shards[0].read().name();
-
-        let shards: Box<[RwLock<T>; NUM_SHARDS]> = shards
-            .into_boxed_slice()
-            .try_into()
-            .unwrap_or_else(|_| unreachable!());
-
         Self { shards, name }
     }
 
-    /// Hash a key and return the shard index.
     #[inline]
-    fn shard_index(key: &str) -> usize {
-        let hash = ahash::RandomState::with_seeds(1, 2, 3, 4).hash_one(key);
-        (hash & SHARD_MASK) as usize
+    fn shard_index(&self, key: &str) -> usize {
+        static HASHER: OnceLock<ahash::RandomState> = OnceLock::new();
+        let hash = HASHER.get_or_init(ahash::RandomState::new).hash_one(key);
+        (hash % self.shards.len() as u64) as usize
     }
 
-    /// Look up a key. For SIEVE, this only needs a read lock (visited bit
-    /// is AtomicBool). For LRU, the inner `get` does move-to-front which
-    /// needs `&mut self`, so we take a write lock regardless — the contention
-    /// difference shows up in benchmarks.
+    /// Look up a key under the policy's exclusive shard lock.
     pub fn get(&self, key: &str) -> Option<Arc<CachedResponse>> {
-        let idx = Self::shard_index(key);
-        let mut shard = self.shards[idx].write();
-        shard.get(key)
+        let idx = self.shard_index(key);
+        self.shards[idx].write().get(key)
     }
 
     /// Insert a key-value pair. Takes a write lock on one shard.
     pub fn insert(&self, key: String, value: CachedResponse) {
-        let idx = Self::shard_index(&key);
+        let idx = self.shard_index(&key);
         let mut shard = self.shards[idx].write();
         shard.insert(key, value);
     }
 
     /// Remove a key explicitly.
     pub fn remove(&self, key: &str) -> bool {
-        let idx = Self::shard_index(key);
+        let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         shard.remove(key)
     }
@@ -111,8 +95,7 @@ impl<T: CachePolicy> ShardedCache<T> {
     }
 }
 
-// ShardedCache is Send + Sync if the inner policy is Send
-unsafe impl<T: CachePolicy> Sync for ShardedCache<T> {}
+// Send and Sync are derived from the policy and lock types.
 
 #[cfg(test)]
 mod tests {
@@ -130,6 +113,40 @@ mod tests {
             body: Bytes::from_static(b"test"),
             inserted_at: Instant::now(),
             ttl: Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn preserves_exact_capacity_for_every_policy() {
+        fn check<T: CachePolicy>(factory: fn(usize) -> T) {
+            for capacity in [1, 2, 63, 64, 65, 127, 10000] {
+                let cache = ShardedCache::new(capacity, factory);
+                assert_eq!(cache.capacity(), capacity);
+                assert_eq!(cache.stats().capacity, capacity);
+                for i in 0..capacity * 2 {
+                    cache.insert(format!("key-{i}"), resp());
+                }
+                assert!(cache.len() <= capacity);
+            }
+        }
+        check(SieveCache::new);
+        check(LruCache::new);
+        check(FifoCache::new);
+    }
+
+    #[test]
+    #[should_panic(expected = "cache capacity must be > 0")]
+    fn rejects_zero_capacity() {
+        ShardedCache::new(0, SieveCache::new);
+    }
+
+    #[test]
+    fn policies_share_the_same_shard_mapping() {
+        let sieve = ShardedCache::new(65, SieveCache::new);
+        let lru = ShardedCache::new(65, LruCache::new);
+        for i in 0..1000 {
+            let key = format!("key-{i}");
+            assert_eq!(sieve.shard_index(&key), lru.shard_index(&key));
         }
     }
 
@@ -164,7 +181,7 @@ mod tests {
 
     #[test]
     fn distributes_across_shards() {
-        let cache = ShardedCache::new(640, SieveCache::new);
+        let cache = ShardedCache::new(4096, SieveCache::new);
 
         // Insert enough keys that they should spread across multiple shards
         for i in 0..200 {
