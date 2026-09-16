@@ -197,6 +197,14 @@ impl CacheLayer {
         }
     }
 
+    /// Invalidate both policy copies after a successful HTTP mutation.
+    pub fn invalidate_http(&self, key: &str) {
+        self.primary.remove(key);
+        if let Some(comparison) = &self.comparison {
+            comparison.remove(key);
+        }
+    }
+
     pub fn primary_stats(&self) -> CacheStats {
         self.primary.stats()
     }
@@ -251,22 +259,34 @@ pub fn parse_cache_control(value: &str) -> CacheControl {
         max_age: None,
     };
 
-    for directive in value.split(',').map(|s| s.trim().to_lowercase()) {
-        if directive == "no-store" || directive == "no-cache" || directive == "private" {
+    let mut max_age = None;
+    let mut shared_max_age = None;
+    for directive in value.split(',') {
+        let (name, argument) = directive
+            .trim()
+            .split_once('=')
+            .map_or((directive.trim(), None), |(name, value)| {
+                (name.trim(), Some(value.trim().trim_matches('"')))
+            });
+        if ["no-store", "no-cache", "private"]
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        {
             result.cacheable = false;
         }
-        if let Some(age) = directive.strip_prefix("max-age=") {
-            if let Ok(secs) = age.trim().parse::<u64>() {
-                result.max_age = Some(Duration::from_secs(secs));
-            }
-        }
-        if let Some(age) = directive.strip_prefix("s-maxage=") {
-            if let Ok(secs) = age.trim().parse::<u64>() {
-                // s-maxage takes precedence for shared caches
-                result.max_age = Some(Duration::from_secs(secs));
+        if name.eq_ignore_ascii_case("max-age") || name.eq_ignore_ascii_case("s-maxage") {
+            let target = if name.eq_ignore_ascii_case("s-maxage") {
+                &mut shared_max_age
+            } else {
+                &mut max_age
+            };
+            match argument.and_then(|value| value.parse::<u64>().ok()) {
+                Some(seconds) if target.is_none() => *target = Some(Duration::from_secs(seconds)),
+                _ => result.cacheable = false, // Invalid or duplicate freshness is unsafe to reuse.
             }
         }
     }
+    result.max_age = shared_max_age.or(max_age);
 
     result
 }
