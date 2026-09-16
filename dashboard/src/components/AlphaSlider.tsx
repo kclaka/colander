@@ -67,6 +67,7 @@ export function AlphaSlider() {
       </div>
       <div className="flex items-center gap-4">
         <input
+          aria-label="Zipfian alpha"
           type="range"
           min="0.1"
           max="2.0"
@@ -84,8 +85,8 @@ export function AlphaSlider() {
         <span>2.0 (very skewed)</span>
       </div>
       <p className="text-xs text-slate-500 mt-2">
-        Higher {"\u03B1"} = more skewed traffic = SIEVE pulls further ahead of
-        LRU
+        Higher {"\u03B1"} concentrates traffic on fewer items. Compare policy
+        hit rates under the same workload.
       </p>
     </div>
   );

@@ -62,7 +62,7 @@ export function HitRateChart({ history }: Props) {
           <Line
             type="monotone"
             dataKey="sieve"
-            name="SIEVE"
+            name={history.at(-1)?.primary.name ?? "Primary"}
             stroke="#22d3ee"
             strokeWidth={2}
             dot={false}
@@ -71,7 +71,7 @@ export function HitRateChart({ history }: Props) {
           <Line
             type="monotone"
             dataKey="lru"
-            name="LRU"
+            name={history.at(-1)?.comparison?.name ?? "Comparison"}
             stroke="#f472b6"
             strokeWidth={2}
             dot={false}

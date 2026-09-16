@@ -55,14 +55,14 @@ export function StatsCards({ latest }: Props) {
   return (
     <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
       <StatCard
-        label="SIEVE Hit Rate"
+        label={`${p.name} Hit Rate`}
         value={`${sieveHR}%`}
         sub={`${p.hits.toLocaleString()} hits / ${p.misses.toLocaleString()} misses`}
         color="text-cyan-400"
       />
       <StatCard
-        label="LRU Hit Rate"
-        value={`${lruHR}%`}
+        label={`${c?.name ?? "Comparison"} Hit Rate`}
+        value={c ? `${lruHR}%` : "—"}
         sub={
           c
             ? `${c.hits.toLocaleString()} hits / ${c.misses.toLocaleString()} misses`
@@ -71,9 +71,9 @@ export function StatsCards({ latest }: Props) {
         color="text-pink-400"
       />
       <StatCard
-        label="SIEVE Advantage"
-        value={advantage ? `+${advantage}%` : "—"}
-        sub="relative to LRU"
+        label={`${p.name} Advantage`}
+        value={advantage !== null ? `${Number(advantage) > 0 ? "+" : ""}${advantage}%` : "—"}
+        sub={c ? `relative to ${c.name}` : "no comparison"}
         color={
           advantage && parseFloat(advantage) > 0
             ? "text-emerald-400"
