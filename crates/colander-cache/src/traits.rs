@@ -36,6 +36,9 @@ pub trait CachePolicy: Send {
     /// Look up a key. Returns the cached response if found and not expired.
     fn get(&mut self, key: &str) -> Option<Arc<CachedResponse>>;
 
+    /// Inspect a live entry without changing statistics or eviction state.
+    fn peek(&self, key: &str) -> Option<Arc<CachedResponse>>;
+
     /// Insert a key-value pair. May trigger eviction if at capacity.
     fn insert(&mut self, key: String, value: CachedResponse);
 

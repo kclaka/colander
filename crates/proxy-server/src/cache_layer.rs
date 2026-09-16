@@ -26,6 +26,14 @@ enum CacheInner {
 }
 
 impl CacheInner {
+    fn peek(&self, key: &str) -> Option<Arc<CachedResponse>> {
+        match self {
+            CacheInner::Sieve(c) => c.peek(key),
+            CacheInner::Lru(c) => c.peek(key),
+            CacheInner::Fifo(c) => c.peek(key),
+        }
+    }
+
     fn get(&self, key: &str) -> Option<Arc<CachedResponse>> {
         match self {
             CacheInner::Sieve(c) => c.get(key),
@@ -132,7 +140,14 @@ impl CacheLayer {
 
         let comparison_hit = if self.is_demo_mode() {
             if let Some(comp) = &self.comparison {
-                comp.get(key).is_some()
+                let hit = comp.get(key).is_some();
+                // A shadow miss still needs the object when primary serves a hit.
+                if !hit {
+                    if let Some(value) = &primary_result {
+                        comp.insert(key.to_owned(), (**value).clone());
+                    }
+                }
+                hit
             } else {
                 false
             }
@@ -150,7 +165,11 @@ impl CacheLayer {
     pub fn insert(&self, key: String, value: CachedResponse) {
         if self.is_demo_mode() {
             if let Some(comp) = &self.comparison {
-                comp.insert(key.clone(), value.clone());
+                // A primary miss may already be a shadow hit. Preserve its entry
+                // and policy state; a second lookup must not skew hit counters.
+                if comp.peek(&key).is_none() {
+                    comp.insert(key.clone(), value.clone());
+                }
             }
         }
         self.primary.insert(key, value);
@@ -274,4 +293,62 @@ pub fn parse_cache_control(value: &str) -> CacheControl {
 pub struct CacheControl {
     pub cacheable: bool,
     pub max_age: Option<Duration>,
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+
+    fn cache() -> CacheLayer {
+        CacheLayer::new("sieve", Some("lru"), 1024, Duration::from_secs(60), 1024)
+    }
+
+    #[test]
+    fn primary_hit_populates_a_shadow_miss_without_extra_statistics() {
+        let cache = cache();
+        cache.insert(
+            "key".into(),
+            cache.build_response(200, vec![], Bytes::from_static(b"value"), None),
+        );
+        cache.comparison.as_ref().unwrap().remove("key");
+        let lookup = cache.get("key");
+        assert!(lookup.is_hit());
+        assert!(!lookup.comparison_hit);
+        let stats = cache.comparison_stats().unwrap();
+        assert_eq!((stats.hits, stats.misses, stats.current_size), (0, 1, 1));
+        assert!(cache.get("key").comparison_hit);
+    }
+
+    #[test]
+    fn primary_miss_does_not_replace_a_shadow_hit_or_count_an_extra_lookup() {
+        let cache = cache();
+        cache.insert(
+            "key".into(),
+            cache.build_response(200, vec![], Bytes::from_static(b"old"), None),
+        );
+        cache.primary.remove("key");
+        let lookup = cache.get("key");
+        assert!(!lookup.is_hit());
+        assert!(lookup.comparison_hit);
+        cache.insert(
+            "key".into(),
+            cache.build_response(200, vec![], Bytes::from_static(b"fresh"), None),
+        );
+        let comparison = cache.comparison.as_ref().unwrap();
+        assert_eq!(comparison.peek("key").unwrap().body, "old");
+        assert_eq!((comparison.stats().hits, comparison.stats().misses), (1, 0));
+    }
+
+    #[test]
+    fn bench_mode_does_not_populate_or_touch_shadow_cache() {
+        let cache = cache();
+        cache.set_mode(CacheMode::Bench);
+        cache.insert(
+            "key".into(),
+            cache.build_response(200, vec![], Bytes::from_static(b"value"), None),
+        );
+        cache.get("key");
+        let stats = cache.comparison_stats().unwrap();
+        assert_eq!((stats.hits, stats.misses, stats.current_size), (0, 0, 0));
+    }
 }

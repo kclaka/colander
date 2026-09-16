@@ -85,26 +85,54 @@ pub async fn metrics_broadcaster(
     start_time: Instant,
 ) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
-    let mut prev_total_requests: u64 = 0;
+    let mut previous_cache: Option<Arc<CacheLayer>> = None;
+    let mut previous_primary: Option<PolicyMetrics> = None;
+    let mut previous_comparison: Option<PolicyMetrics> = None;
+    let mut previous_sample = Instant::now();
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         interval.tick().await;
 
-        let cache = state.cache.load();
+        let cache = state.cache.load_full();
         let primary = PolicyMetrics::from_cache(&cache, true).unwrap(); // primary always Some
         let comparison = PolicyMetrics::from_cache(&cache, false);
 
-        let current_total = primary.hits + primary.misses;
-        let delta = current_total.saturating_sub(prev_total_requests);
-        let throughput = delta as f64 * 2.0; // 500ms window → multiply by 2 for per-second
-        prev_total_requests = current_total;
+        let now = Instant::now();
+        let window = now.duration_since(previous_sample);
+        previous_sample = now;
+        let same_cache = previous_cache
+            .as_ref()
+            .is_some_and(|previous| Arc::ptr_eq(previous, &cache));
+        if !same_cache {
+            for (old, role) in [
+                (previous_primary.as_ref(), "primary"),
+                (previous_comparison.as_ref(), "comparison"),
+            ] {
+                if let Some(old) = old {
+                    ::metrics::gauge!("colander_cache_keys", "policy" => old.name.clone(), "role" => role).set(0.0);
+                    ::metrics::gauge!("colander_cache_capacity", "policy" => old.name.clone(), "role" => role).set(0.0);
+                }
+            }
+            previous_primary = None;
+            previous_comparison = None;
+        }
+        let throughput = lookup_rate(&primary, previous_primary.as_ref(), window);
+        publish_policy(&primary, previous_primary.as_ref(), "primary");
+        if let Some(comparison) = &comparison {
+            publish_policy(comparison, previous_comparison.as_ref(), "comparison");
+        }
+        ::metrics::gauge!("colander_cache_lookups_per_second").set(throughput);
+        previous_cache = Some(cache.clone());
+        previous_primary = Some(primary.clone());
+        previous_comparison = comparison.clone();
 
         let snapshot = MetricsSnapshot {
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap() // safe: clock is after 1970
                 .as_millis(),
-            window_ms: 500,
+            window_ms: window.as_millis().max(1) as u64,
             primary,
             comparison,
             throughput_rps: throughput,
@@ -115,6 +143,43 @@ pub async fn metrics_broadcaster(
         // Ignore send errors (no subscribers)
         let _ = tx.send(snapshot);
     }
+}
+
+fn lookup_rate(
+    current: &PolicyMetrics,
+    previous: Option<&PolicyMetrics>,
+    window: std::time::Duration,
+) -> f64 {
+    let old = previous.map_or(0, |p| p.hits + p.misses);
+    let count = (current.hits + current.misses).saturating_sub(old);
+    count as f64 / window.as_secs_f64().max(0.001)
+}
+
+fn publish_policy(current: &PolicyMetrics, previous: Option<&PolicyMetrics>, role: &'static str) {
+    for (metric, value, old) in [
+        (
+            "colander_cache_hits_total",
+            current.hits,
+            previous.map_or(0, |p| p.hits),
+        ),
+        (
+            "colander_cache_misses_total",
+            current.misses,
+            previous.map_or(0, |p| p.misses),
+        ),
+        (
+            "colander_cache_evictions_total",
+            current.evictions,
+            previous.map_or(0, |p| p.evictions),
+        ),
+    ] {
+        ::metrics::counter!(metric, "policy" => current.name.clone(), "role" => role)
+            .increment(value.saturating_sub(old));
+    }
+    ::metrics::gauge!("colander_cache_keys", "policy" => current.name.clone(), "role" => role)
+        .set(current.size as f64);
+    ::metrics::gauge!("colander_cache_capacity", "policy" => current.name.clone(), "role" => role)
+        .set(current.capacity as f64);
 }
 
 /// WebSocket upgrade handler for /ws/metrics.
@@ -187,4 +252,60 @@ pub async fn stats_handler(State(state): State<MetricsState>) -> impl IntoRespon
         "comparison": comparison,
         "mode": format!("{:?}", cache.mode()).to_lowercase(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn sample(hits: u64) -> PolicyMetrics {
+        PolicyMetrics {
+            name: "SIEVE".into(),
+            hits,
+            misses: 0,
+            evictions: 0,
+            hit_rate: 1.0,
+            size: 2,
+            capacity: 64,
+        }
+    }
+
+    #[test]
+    fn uses_actual_window_and_resets_baseline_after_cache_replacement() {
+        assert_eq!(
+            lookup_rate(&sample(10), Some(&sample(4)), Duration::from_secs(2)),
+            3.0
+        );
+        assert_eq!(
+            lookup_rate(&sample(2), None, Duration::from_millis(500)),
+            4.0
+        );
+    }
+
+    #[test]
+    fn prometheus_exports_real_counters_and_gauges_without_double_counting() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || {
+            publish_policy(&sample(4), None, "primary");
+            publish_policy(&sample(6), Some(&sample(4)), "primary");
+            publish_policy(&sample(6), Some(&sample(6)), "primary");
+            // A replaced cache adds its new counts to the monotonic series.
+            publish_policy(&sample(2), None, "primary");
+        });
+        let output = handle.render();
+        assert!(
+            output.contains("colander_cache_hits_total{policy=\"SIEVE\",role=\"primary\"} 8"),
+            "{output}"
+        );
+        assert!(
+            output.contains("colander_cache_keys{policy=\"SIEVE\",role=\"primary\"} 2"),
+            "{output}"
+        );
+        assert!(
+            output.contains("colander_cache_capacity{policy=\"SIEVE\",role=\"primary\"} 64"),
+            "{output}"
+        );
+    }
 }
