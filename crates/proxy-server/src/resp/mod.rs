@@ -29,9 +29,13 @@ pub async fn run_resp_server(addr: &str, state: Arc<AppState>, shutdown: Cancell
                 match result {
                     Ok((stream, peer)) => {
                         let state = Arc::clone(&state);
+                        let client_shutdown = shutdown.clone();
                         tokio::spawn(async move {
                             tracing::debug!(peer = %peer, "RESP client connected");
-                            connection::handle_connection(stream, &state).await;
+                            tokio::select! {
+                                _ = client_shutdown.cancelled() => {},
+                                _ = connection::handle_connection(stream, &state) => {},
+                            }
                             tracing::debug!(peer = %peer, "RESP client disconnected");
                         });
                     }
