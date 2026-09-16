@@ -1,480 +1,379 @@
-<p align="center">
-  <strong>Colander</strong><br>
-  High-performance HTTP caching reverse proxy powered by SIEVE
-</p>
+<h1 align="center">Colander</h1>
+<p align="center">Explore cache eviction with a Rust HTTP proxy, a Zipfian load generator, and a live dashboard.</p>
 
 <p align="center">
-  <a href="https://github.com/kclaka/colander/actions/workflows/ci.yml"><img src="https://github.com/kclaka/colander/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kclaka/colander/actions/workflows/ci.yml"><img src="https://github.com/kclaka/colander/actions/workflows/ci.yml/badge.svg?branch=main" alt="Rust CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-2021_edition-orange.svg" alt="Rust"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-2021_edition-orange.svg" alt="Rust 2021 edition"></a>
 </p>
 
----
+Colander implements **SIEVE**, the cache eviction algorithm introduced at
+[NSDI ’24](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo),
+alongside LRU and FIFO. Run the local demo to see how cache capacity, request
+skew, and eviction policy affect hit rates.
 
-Colander is a drop-in caching reverse proxy that replaces LRU with the [SIEVE](https://cachemon.github.io/SIEVE-website/) eviction algorithm (published at [NSDI '24](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo)). It sits between your clients and your backend, caches HTTP responses, and speaks both **HTTP** and the **Redis wire protocol (RESP2)** — so you can swap out Redis for SIEVE-powered caching with zero code changes.
+- **Cache library:** arena-backed storage, lazy TTL expiration, and up to 64 shards.
+- **HTTP demo:** a caching proxy in front of a synthetic origin with 5–20 ms latency.
+- **Adjustable traffic:** control dataset size, concurrency, request rate, and Zipfian alpha.
+- **Live inspection:** React charts, JSON statistics, and WebSocket snapshots.
+
+The project is an experimental cache playground. See [current scope](#current-scope)
+for the HTTP, Redis, and observability features that are still incomplete.
+
+[Quick start](#quick-start) · [Run from source](#run-from-source) ·
+[Architecture](#architecture) · [Experiments](#experiments) ·
+[Configuration](#configuration) · [API](#api) ·
+[Development](#development) · [Troubleshooting](#troubleshooting)
+
+## Quick start
+
+Install Docker with the Compose plugin, then run:
 
 ```bash
-docker compose up          # proxy + backend + load generator + dashboard
-open http://localhost:3001  # watch SIEVE outperform LRU in real time
+git clone https://github.com/kclaka/colander.git
+cd colander
+docker compose up --build -d
+docker compose ps
 ```
 
----
+Open **[localhost:3001](http://localhost:3001)** for the dashboard. Compose starts
+the origin, proxy, dashboard, and a continuous load generator. The first build
+compiles the Rust workspace and installs the dashboard dependencies.
 
-## Table of Contents
+| Service | Address | Purpose |
+| --- | --- | --- |
+| Dashboard | [localhost:3001](http://localhost:3001) | Charts and workload controls |
+| HTTP proxy | [localhost:8080](http://localhost:8080) | Routes requests to the origin |
+| Metrics/admin | [localhost:9090/api/stats](http://localhost:9090/api/stats) | JSON statistics and mode control |
+| Demo origin | [localhost:3000/health](http://localhost:3000/health) | Health check; `/api/items/{id}` serves items |
+| Load generator | [localhost:9091/status](http://localhost:9091/status) | Traffic status and control |
+| Experimental RESP2 | `localhost:6379` | Redis protocol development; see [current scope](#current-scope) |
 
-- [Why SIEVE](#why-sieve)
-- [Architecture](#architecture)
-- [Features](#features)
-- [Quick Start](#quick-start)
-  - [Docker (recommended)](#docker-recommended)
-  - [From source](#from-source)
-- [Configuration](#configuration)
-  - [Server](#server)
-  - [Upstream](#upstream)
-  - [Cache](#cache)
-  - [RESP](#resp)
-  - [Hot-Reload](#hot-reload)
-- [Redis Interface (RESP2)](#redis-interface-resp2)
-- [Prometheus Metrics](#prometheus-metrics)
-- [Live Dashboard](#live-dashboard)
-- [HTTP Response Headers](#http-response-headers)
-- [Admin API](#admin-api)
-- [Cache Design](#cache-design)
-  - [Eviction Policies](#eviction-policies)
-  - [Arena Allocation](#arena-allocation)
-  - [64-Shard Concurrency](#64-shard-concurrency)
-  - [Lazy TTL Expiration](#lazy-ttl-expiration)
-- [Project Structure](#project-structure)
-- [Development](#development)
-- [References](#references)
-- [License](#license)
+### Check a cache miss and hit
 
----
+Use an item outside the load generator's default 1–100,000 range:
 
-## Why SIEVE
+```bash
+curl -si http://localhost:8080/api/items/100001
+curl -si http://localhost:8080/api/items/100001
+```
 
-Traditional caches use **LRU**, which moves every accessed item to the front of a linked list. That means a **write lock on every cache hit** — a scalability wall on multi-core systems.
+With a fresh cache, the first response includes `X-Cache: MISS` and the second
+includes `X-Cache: HIT`. Header names may appear lowercase. Repeating the example
+can return two hits; expiration or eviction can produce another miss.
 
-**SIEVE** replaces move-to-front with a single atomic bit flip on hit. A roving "hand" pointer handles eviction by scanning from tail to head, keeping visited items in place and evicting cold ones. No list mutation. No write contention.
+```bash
+curl -fsS http://localhost:9090/api/stats
+docker compose logs --tail=50 proxy
+```
 
-| Property | LRU | SIEVE |
-|----------|-----|-------|
-| Hit operation | Move-to-front (write lock) | Flip atomic visited bit (shard write lock) |
-| Eviction | Always evict tail | Hand scans for unvisited |
-| Miss ratio | Baseline | [Up to 63% lower](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo) than ARC |
-| Multi-thread scaling | Limited by write contention | Near-linear to 16+ threads |
-| Parameters | None | None |
-| Per-object metadata | Pointer × 2 | 1 bit (visited) + pointer × 2 |
+Stop the demo when finished:
 
-> **Key insight from the paper**: SIEVE achieves "lazy promotion" and "quick demotion" — popular objects stay in place without being moved, while one-hit wonders are quickly evicted. This makes it especially effective for web cache workloads with power-law (Zipfian) access patterns.
+```bash
+docker compose down
+```
 
-Read the full paper: [*SIEVE is Simpler than LRU: an Efficient Turn-Key Eviction Algorithm for Web Caches*](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo) (NSDI '24).
+Cache contents are held in memory and are lost when the proxy restarts.
 
----
+## Run from source
+
+Use a current stable [Rust toolchain](https://www.rust-lang.org/tools/install).
+The repository does not declare a minimum supported Rust version. For the
+dashboard, use Node.js **22.12+** or a newer supported release; the locked Vite 7
+dependencies also accept Node 20.19+ ([Vite requirements](https://vite.dev/guide/)).
+
+From the cloned repository, build the binaries once:
+
+```bash
+cargo build --workspace
+```
+
+Start each service in a **separate terminal**. Run Rust commands from the
+repository root so the proxy loads the checked-in `config.toml`.
+
+**Terminal 1 — origin**
+
+```bash
+cargo run -p demo-backend
+```
+
+**Terminal 2 — proxy**
+
+```bash
+cargo run -p proxy-server
+```
+
+**Terminal 3 — dashboard**
+
+```bash
+cd dashboard
+npm ci
+npm run dev
+```
+
+**Terminal 4 — optional traffic generator**
+
+```bash
+cargo run -p loadgen -- \
+  --proxy-url http://127.0.0.1:8080 \
+  --num-items 100000 \
+  --concurrency 16 \
+  --rps 500 \
+  --alpha 0.8
+```
+
+Open [localhost:3001](http://localhost:3001). The Vite development server forwards
+metrics and control requests to ports 9090 and 9091. Without the load generator,
+you can still send manual HTTP requests and inspect the cache; the alpha control
+will show the generator as offline. Use Ctrl+C in each terminal to stop it.
 
 ## Architecture
 
-```
-                    ┌──────────────────────────────────────────────┐
-                    │              Colander Proxy                  │
-                    │                                              │
-┌──────────┐  HTTP  │  ┌──────────────────────────────────────┐   │        ┌──────────┐
-│  Clients │───:8080──▶│           Cache Layer                │   │──:3000─▶│ Backend  │
-└──────────┘       │  │  ┌──────────┐       ┌──────────┐     │   │        └──────────┘
-                    │  │  │  SIEVE   │       │   LRU    │     │   │
-┌──────────┐  RESP  │  │  │ (primary)│       │ (shadow) │     │   │
-│ Redis    │───:6379──▶│  └──────────┘       └──────────┘     │   │
-│ clients  │       │  │       64 shards × RwLock              │   │
-└──────────┘       │  └──────────────────────────────────────┘   │
-                    │                                              │
-┌──────────┐  WS    │           Metrics Engine                    │
-│Dashboard │◀──:9090──│  WebSocket broadcast @ 500ms              │
-│ (React)  │       │  │  Prometheus GET /metrics                  │
-└──────────┘       │  │  Admin API (mode toggle, stats)           │
-                    └──────────────────────────────────────────────┘
-
-┌──────────┐
-│ Load Gen │  Zipfian(α) traffic → proxy:8080
-│ (tunable)│  POST /control to adjust α at runtime
-└──────────┘
+```mermaid
+flowchart LR
+    Clients["HTTP clients"] --> Proxy["HTTP proxy :8080"]
+    Loadgen["Zipfian load generator :9091"] --> Proxy
+    Proxy --> Primary["Primary cache: SIEVE by default"]
+    Proxy -. "demo lookups" .-> Shadow["Comparison cache: LRU by default"]
+    Proxy -- "cache miss" --> Origin["Demo origin :3000"]
+    Primary --> Metrics["Statistics and WebSocket API :9090"]
+    Shadow --> Metrics
+    Metrics -- "snapshots" --> Dashboard["Dashboard :3001"]
+    Dashboard -- "mode" --> Metrics
+    Dashboard -- "alpha" --> Loadgen
 ```
 
-**Dual-cache mode**: every request hits both SIEVE (primary) and LRU (comparison). Responses are served from SIEVE; LRU runs in shadow mode for a fair, same-traffic comparison. Toggle to **bench mode** via the [Admin API](#admin-api) for single-policy throughput numbers.
+The proxy serves cached responses from the primary policy. In demo mode, it also
+looks up keys in a comparison cache. The synthetic origin makes cache misses
+visible by adding latency. Both caches have separate storage and statistics.
 
----
+### What SIEVE changes
 
-## Features
+SIEVE marks an entry as visited on a hit. During eviction, a hand scans from the
+tail toward the head, clearing visited bits and removing an unvisited entry.
+Visited entries stay in place rather than moving to the front of the list.
 
-| Category | Feature |
-|----------|---------|
-| **Caching** | SIEVE, LRU, and FIFO eviction policies behind a common trait |
-| **Protocols** | HTTP reverse proxy (`:8080`) + [RESP2 Redis interface](#redis-interface-resp2) (`:6379`) |
-| **Observability** | [Prometheus metrics](#prometheus-metrics) (`:9090/metrics`), WebSocket live stream, [React dashboard](#live-dashboard) |
-| **Operability** | [Graceful shutdown](#graceful-shutdown) (SIGINT/SIGTERM), [config hot-reload](#hot-reload), per-policy stats |
-| **Performance** | Up to 64 shards, arena-allocated linked lists, atomic visited bits (SIEVE), `ahash` for DoS-resistant sharding |
-| **DevOps** | Docker Compose one-click demo, [GitHub Actions CI](#development) (fmt + clippy + test) |
+| Policy | On a live hit | When full |
+| --- | --- | --- |
+| SIEVE | Mark the visited bit | Scan for an unvisited entry |
+| LRU | Move the entry to the head | Evict the least recently used entry |
+| FIFO | Leave insertion order unchanged | Evict the oldest entry |
 
----
+In **this implementation**, every policy lookup takes a shard write lock to
+update statistics and remove expired entries. SIEVE avoids list promotion, but
+Colander's hit path is not lock-free. The original paper's performance results
+are research context, not benchmark results for this repository.
 
-## Quick Start
+[`colander-cache`](crates/colander-cache/) stores list nodes in an arena using
+`u32` indices and a reusable free list. Shards share a process-random hash mapping
+across policies. Capacity is distributed exactly across up to 64 shards, with
+fewer shards for small caches. Eviction is local to each shard, so uneven key
+distribution can cause eviction before every slot in the overall cache is full.
 
-### Docker (recommended)
+Expired entries are removed on lookup; SIEVE can also remove them during its
+eviction scan. There is no background expiration sweep.
+
+## Experiments
+
+### Change the workload
+
+Higher alpha concentrates requests on fewer items. The load-generator API accepts
+values from `0.01` to `3.0`; the dashboard slider exposes a narrower range.
 
 ```bash
-docker compose up --build
+# Change skew while traffic is running.
+curl -fsS http://localhost:9091/control \
+  -H 'Content-Type: application/json' \
+  -d '{"alpha":1.2}'
+
+# Pause traffic to inspect the cache.
+curl -fsS http://localhost:9091/control \
+  -H 'Content-Type: application/json' \
+  -d '{"running":false}'
+
+# Resume traffic.
+curl -fsS http://localhost:9091/control \
+  -H 'Content-Type: application/json' \
+  -d '{"running":true}'
 ```
 
-| Service | Port | Description |
-|---------|------|-------------|
-| Proxy | [`localhost:8080`](http://localhost:8080) | HTTP caching reverse proxy |
-| Metrics | [`localhost:9090`](http://localhost:9090) | Prometheus + WebSocket + Admin API |
-| RESP | `localhost:6379` | Redis wire protocol interface |
-| Dashboard | [`localhost:3001`](http://localhost:3001) | Live SIEVE vs LRU charts |
-| Backend | `localhost:3000` | Demo origin with 5–20ms latency |
-| Load Gen | `localhost:9091` | Zipfian traffic control |
+`--rps` limits the aggregate request rate across all workers; `0` means unlimited.
+Compose uses unlimited traffic by default. Dataset size and concurrency must be
+positive. Use `cargo run -p loadgen -- --help` for all startup options.
 
-### From source
+### Switch modes
 
-Prerequisites: [Rust](https://www.rust-lang.org/tools/install) (1.70+), [Node.js](https://nodejs.org/) 18+ (for dashboard only).
+| Mode | Primary cache | Comparison cache |
+| --- | --- | --- |
+| `demo` (initial mode) | Serves requests | Participates in cache lookups and insertions |
+| `bench` | Serves requests | Skipped by the HTTP lookup/insertion path |
 
 ```bash
-# Terminal 1 — demo backend
-cargo run -p demo-backend
-
-# Terminal 2 — proxy
-cargo run -p proxy-server
-
-# Terminal 3 — test it
-curl -v http://localhost:8080/api/items/42   # X-Cache: MISS
-curl -v http://localhost:8080/api/items/42   # X-Cache: HIT
-
-# Redis protocol
-redis-cli -p 6379 PING                      # PONG
-redis-cli -p 6379 SET foo bar               # OK
-redis-cli -p 6379 GET foo                   # "bar"
+curl -fsS http://localhost:9090/api/mode \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"bench"}'
 ```
 
----
+Use `{"mode":"demo"}` to switch back. Switching mode does not reset cache contents
+or counters. To compare separate runs, restart the proxy and record the policy,
+capacity, TTL, dataset size, alpha, concurrency, and RPS limit for each run.
+
+Hit rates are cumulative since cache creation. Dashboard throughput is derived
+from primary cache lookups, rather than counting every HTTP request. A higher
+alpha does not guarantee that SIEVE wins. The [comparison limitations](#current-scope)
+also matter when interpreting the charts.
 
 ## Configuration
 
-Colander reads from `config.toml` in the working directory. All fields have defaults — the file is optional.
-
-### Server
-
-```toml
-[server]
-listen_addr = "0.0.0.0:8080"    # HTTP proxy bind address
-metrics_addr = "0.0.0.0:9090"   # Metrics/admin bind address
-```
-
-### Upstream
-
-```toml
-[upstream]
-url = "http://localhost:3000"    # Backend origin URL
-timeout_ms = 5000                # Upstream request timeout
-```
-
-### Cache
-
-```toml
-[cache]
-capacity = 10000                 # Max entries across all shards
-default_ttl_seconds = 60         # Default TTL when Cache-Control is absent
-max_body_size_bytes = 1048576    # 1 MB — responses larger than this are not cached
-eviction_policy = "sieve"        # Primary policy: "sieve", "lru", or "fifo"
-comparison_policy = "lru"        # Shadow policy for dual-cache comparison (optional)
-```
-
-### RESP
-
-```toml
-[resp]
-enabled = true                   # Enable/disable Redis protocol interface
-listen_addr = "0.0.0.0:6379"    # RESP bind address
-```
-
-### Hot-Reload
-
-Colander watches `config.toml` for changes at runtime. When a change is detected:
-
-| Field | Behavior | Downtime |
-|-------|----------|----------|
-| `default_ttl_seconds` | Applied immediately via atomic swap | **None** — cache data preserved |
-| `eviction_policy` / `comparison_policy` | Cache rebuilt with new policy | Cache cleared (cold start) |
-| `capacity` | **Ignored** — logged as WARN | Restart required |
-
-> **Why capacity changes are rejected**: If a running cache is full (e.g., 1M items) and capacity drops to 500K, the next request would synchronously evict 500K items in a tight loop, stalling the event loop and spiking P99 latency. Colander prioritizes stability over flexibility — restart to resize safely.
-
----
-
-## Redis Interface (RESP2)
-
-Colander speaks the [Redis Serialization Protocol](https://redis.io/docs/latest/develop/reference/protocol-spec/) on port `6379`. Point any Redis client at Colander and get SIEVE-powered caching — no code changes needed.
-
-```bash
-redis-cli -p 6379
-```
-
-### Supported Commands
-
-| Command | Syntax | Description |
-|---------|--------|-------------|
-| **PING** | `PING` | Health check. Returns `PONG`. |
-| **GET** | `GET key` | Retrieve a cached value. Returns bulk string or `(nil)`. |
-| **SET** | `SET key value [EX seconds]` | Store a value with optional TTL. Returns `OK`. |
-| **DEL** | `DEL key [key ...]` | Delete one or more keys. Returns count of deleted keys. |
-| **TTL** | `TTL key` | Seconds remaining before expiry. Returns `-2` if key missing. |
-| **EXPIRE** | `EXPIRE key seconds` | Not supported (TTL is set-at-insert). Returns `0`. |
-| **COMMAND** | `COMMAND` | Client compatibility (redis-cli sends this on connect). Returns `OK`. |
-
-### Example
-
-```bash
-$ redis-cli -p 6379
-127.0.0.1:6379> SET session:abc '{"user":"kenny"}' EX 300
-OK
-127.0.0.1:6379> GET session:abc
-"{\"user\":\"kenny\"}"
-127.0.0.1:6379> TTL session:abc
-(integer) 299
-127.0.0.1:6379> DEL session:abc
-(integer) 1
-127.0.0.1:6379> GET session:abc
-(nil)
-```
-
-> **Shared cache**: The RESP interface shares the same in-memory cache as the HTTP proxy. A `SET` via Redis is visible to HTTP `GET` responses, and vice versa.
-
----
-
-## Prometheus Metrics
-
-Colander exposes [Prometheus](https://prometheus.io/)-compatible metrics at `GET :9090/metrics`.
-
-```bash
-curl http://localhost:9090/metrics
-```
-
-### Available Metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `colander_cache_hits_total` | counter | `policy` | Total cache hits |
-| `colander_cache_misses_total` | counter | `policy` | Total cache misses |
-| `colander_cache_keys` | gauge | `policy` | Current number of cached entries |
-| `colander_cache_evictions_total` | gauge | `policy` | Total evictions |
-| `colander_request_duration_seconds` | histogram | — | End-to-end request latency |
-| `colander_upstream_duration_seconds` | histogram | — | Upstream (origin) latency on cache misses |
-
-### Grafana
-
-Add `http://proxy:9090` as a Prometheus data source in [Grafana](https://grafana.com/) and import/build dashboards using the metrics above.
-
----
-
-## Live Dashboard
-
-The React dashboard at [`localhost:3001`](http://localhost:3001) connects via WebSocket to the proxy's metrics engine and renders:
-
-- **Hit rate chart** — SIEVE vs LRU hit rate over time
-- **Throughput chart** — requests/second over time
-- **Stats cards** — live counters for hits, misses, evictions, cache size, uptime
-- **Alpha slider** — adjust the Zipfian skewness parameter (α) of the load generator in real time
-- **Mode toggle** — switch between Demo (dual-cache) and Bench (single-cache) mode
-
-Built with [Vite](https://vitejs.dev/), [React](https://react.dev/), and [Recharts](https://recharts.org/).
-
----
-
-## HTTP Response Headers
-
-Colander adds the following headers to every proxied response:
-
-| Header | Values | Description |
-|--------|--------|-------------|
-| `X-Cache` | `HIT` / `MISS` | Whether the response was served from cache |
-| `X-Cache-Policy` | `SIEVE` / `LRU` / `FIFO` | Which eviction policy served the response |
-| `X-Mode` | `demo` / `bench` | Current cache mode |
-
-### Caching Behavior
-
-- Only **GET** requests with **200 OK** responses are cached
-- Responses larger than `max_body_size_bytes` are not cached
-- `Cache-Control: no-store`, `no-cache`, and `private` are respected
-- `s-maxage` takes precedence over `max-age` (as per [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111))
-
----
-
-## Admin API
-
-The metrics port (`:9090`) exposes administrative endpoints:
-
-### `GET /api/stats`
-
-Returns a JSON snapshot of current cache statistics.
-
-```bash
-curl http://localhost:9090/api/stats
-```
-
-```json
-{
-  "primary": { "name": "SIEVE", "hit_rate": 0.72, "hits": 14400, "misses": 5600, "evictions": 3200, "size": 9800, "capacity": 10000 },
-  "comparison": { "name": "LRU", "hit_rate": 0.65, "hits": 13000, "misses": 7000, "evictions": 4100, "size": 9800, "capacity": 10000 },
-  "mode": "demo"
-}
-```
-
-### `POST /api/mode`
-
-Toggle between demo (dual-cache) and bench (single-cache) mode.
-
-```bash
-curl -X POST http://localhost:9090/api/mode \
-  -H 'Content-Type: application/json' \
-  -d '{"mode": "bench"}'
-```
-
-### `GET /ws/metrics`
-
-WebSocket endpoint streaming [`MetricsSnapshot`](crates/proxy-server/src/metrics.rs) JSON every 500ms. Used by the [dashboard](#live-dashboard).
-
-### `GET /metrics`
-
-[Prometheus text format](#prometheus-metrics) metrics endpoint.
-
----
-
-## Cache Design
-
-### Eviction Policies
-
-The [`colander-cache`](crates/colander-cache/) crate implements three eviction policies behind a common [`CachePolicy`](crates/colander-cache/src/traits.rs) trait:
-
-| Policy | Hit Behavior | Eviction | Best For |
-|--------|-------------|----------|----------|
-| **SIEVE** | Flip visited bit (`AtomicBool`) — no list mutation | Hand scans tail→head, evicts unvisited | Web caches, Zipfian workloads |
-| **LRU** | Move-to-front (requires write lock) | Evict tail (least recently used) | General purpose, baseline comparison |
-| **FIFO** | No-op (no promotion) | Evict tail (oldest) | Scan-heavy workloads |
-
-### Arena Allocation
-
-All policies use an **arena-allocated doubly-linked list** ([`arena.rs`](crates/colander-cache/src/arena.rs)):
-
-- Nodes stored in a `Vec<Option<Node>>` with `u32` indices instead of raw pointers
-- Free-list tracks reclaimed slots for O(1) allocation
-- Zero `unsafe` code — the borrow checker is satisfied through index-based access
-- Cache-line friendly due to contiguous memory layout
-
-### 64-Shard Concurrency
-
-[`ShardedCache<T>`](crates/colander-cache/src/sharded.rs) distributes keys across **up to 64 independent shards** via [`ahash`](https://crates.io/crates/ahash):
-
-- Each shard has its own `parking_lot::RwLock`, arena, and eviction state
-- On a cache hit, only **1 of 64 shards** is locked
-- Shard selection: `ahash(key) & 0x3F` (bitmask for constant-time modulo)
-- All current policy lookups acquire a shard write lock to maintain statistics and remove expired entries. SIEVE avoids LRU list promotion, but is not lock-free.
-- Small caches use fewer shards; remaining slots are distributed so aggregate capacity exactly matches configuration.
-- The random shard hash is shared across policies for comparable key placement.
-
-### Lazy TTL Expiration
-
-Colander uses **lazy expiration** — expired entries are not proactively garbage-collected:
-
-- On `get()`: if the entry's TTL has elapsed, it's treated as a miss and removed
-- On eviction sweep: the SIEVE hand evicts expired entries regardless of their visited bit
-- This avoids background timer threads and keeps the hot path fast
-
----
-
-## Project Structure
-
-```
-colander/
-├── crates/
-│   ├── colander-cache/        # Cache library: SIEVE, LRU, FIFO, arena, sharded wrapper
-│   │   ├── src/
-│   │   │   ├── traits.rs      # CachePolicy trait, CachedResponse, CacheStats
-│   │   │   ├── sieve.rs       # SIEVE implementation
-│   │   │   ├── lru.rs         # LRU implementation
-│   │   │   ├── fifo.rs        # FIFO implementation
-│   │   │   ├── arena.rs       # Arena-allocated doubly-linked list
-│   │   │   └── sharded.rs     # 64-shard concurrent wrapper
-│   │   └── benches/
-│   │       └── cache_bench.rs # Criterion benchmarks
-│   ├── proxy-server/          # HTTP reverse proxy + RESP server + metrics
-│   │   └── src/
-│   │       ├── main.rs        # Entry point, server setup, config watcher
-│   │       ├── proxy.rs       # Axum proxy handler, upstream forwarding
-│   │       ├── cache_layer.rs # Dual-cache wrapper, mode toggle, raw insert
-│   │       ├── config.rs      # TOML config parsing, hot-reload diff
-│   │       ├── metrics.rs     # WebSocket broadcast, stats/mode endpoints
-│   │       └── resp/          # RESP2 Redis protocol server
-│   │           ├── mod.rs     # TCP listener, connection accept loop
-│   │           ├── connection.rs  # Per-connection frame codec
-│   │           └── cmd.rs     # Command dispatch (GET, SET, DEL, TTL, PING)
-│   ├── loadgen/               # Zipfian traffic generator with adjustable α
-│   └── demo-backend/          # Fake origin API with 5–20ms artificial latency
-├── dashboard/                 # React + Vite + Recharts live metrics UI
-├── docker/                    # Dockerfiles for Rust binaries and dashboard
-├── .github/workflows/ci.yml  # GitHub Actions: fmt, clippy, test
-├── config.toml                # Local development configuration
-└── docker-compose.yml         # One-click demo orchestration
-```
-
----
+The proxy reads `config.toml` from its **working directory**. Use the checked-in
+[local configuration](config.toml) as a starting point. Compose mounts
+[`docker/config.toml`](docker/config.toml), where the upstream hostname is `backend`.
+
+If no file exists, the proxy uses built-in defaults. A supplied file must include
+`[upstream]` and its `url`; parse/read failures currently fall back to defaults
+and are logged. These defaults are not identical to the checked-in file: for
+example, the file binds RESP to loopback, while built-in defaults bind it to all
+interfaces.
+
+| Setting | Checked-in local value | Meaning |
+| --- | --- | --- |
+| `server.listen_addr` | `0.0.0.0:8080` | HTTP listener |
+| `server.metrics_addr` | `0.0.0.0:9090` | Statistics, WebSocket, and admin listener |
+| `upstream.url` | `http://127.0.0.1:3000` | Origin; the current client uses HTTP |
+| `upstream.timeout_ms` | `5000` | Declared setting; currently not enforced |
+| `cache.capacity` | `10000` | Entry limit **per policy**, distributed across shards |
+| `cache.default_ttl_seconds` | `60` | Lifetime when a response supplies no parsed max-age |
+| `cache.max_body_size_bytes` | `1048576` | Largest body admitted to the HTTP cache (1 MiB) |
+| `cache.eviction_policy` | `"sieve"` | `"sieve"`, `"lru"`, or `"fifo"` |
+| `cache.comparison_policy` | `"lru"` | Omit this key inside `[cache]` to disable comparison |
+| `resp.enabled` | `true` | Start the experimental RESP listener |
+| `resp.listen_addr` | `127.0.0.1:6379` | Local RESP bind address |
+
+In demo mode, each policy has its own entry capacity; `capacity` is not a byte
+budget. The body-size limit controls cache admission, not upstream response
+buffering. Set `resp.enabled = false` if you only need the HTTP demo.
+
+### Reloading configuration
+
+The watcher attempts to apply TTL and policy changes at runtime. A default-TTL
+change affects newly inserted entries, not existing entries. A policy change
+rebuilds the caches and clears their data and counters.
+
+For predictable behavior, restart after changing capacity, body limits, listener
+addresses, or upstream settings. The current watcher does not reliably handle
+atomic file replacement, and ignored settings can interact with later policy
+reloads. Check startup/reload logs to confirm the configuration being used.
+
+The demo/admin listeners have no authentication, and Compose publishes their
+ports on the host. Run the demo on a trusted local machine; the current HTTP
+cache does not isolate authenticated or personalized traffic.
+
+## API
+
+| Service | Method and path | Result |
+| --- | --- | --- |
+| Proxy `:8080` | Any method, any path | Forwards to the configured origin; eligible GET responses can be cached |
+| Metrics `:9090` | `GET /api/stats` | Primary/comparison cache statistics and mode |
+| Metrics `:9090` | `POST /api/mode` | Set `"demo"` or `"bench"`; invalid modes return 400 |
+| Metrics `:9090` | `GET /ws/metrics` | WebSocket snapshots approximately every 500 ms |
+| Metrics `:9090` | `GET /metrics` | Prometheus recorder output; cache instruments are not registered yet |
+| Loadgen `:9091` | `GET /status` | Alpha, running state, completed requests, and startup parameters |
+| Loadgen `:9091` | `POST /control` | Update `alpha` and/or `running` |
+| Origin `:3000` | `GET /health` | `ok` |
+| Origin `:3000` | `GET /api/items/{id}` | Synthetic JSON item for an unsigned integer ID |
+
+Normal cache-hit and upstream responses include these diagnostic headers.
+Locally generated upstream-error responses do not necessarily include them.
+
+| Header | Values |
+| --- | --- |
+| `X-Cache` | `HIT`, `MISS` |
+| `X-Cache-Policy` | `SIEVE`, `LRU`, `FIFO` |
+| `X-Mode` | `demo`, `bench` |
+
+For response fields, see [`PolicyMetrics` and `MetricsSnapshot`](crates/proxy-server/src/metrics.rs).
+A `hit_rate` is a fraction from 0 to 1; the dashboard displays a percentage.
+
+## Current scope
+
+The HTTP demo, cache policies, load controls, and JSON/WebSocket statistics are
+implemented. The following boundaries describe the code on this branch:
+
+| Area | Current limitation |
+| --- | --- |
+| HTTP forwarding and caching | Request headers are not forwarded. Credential/cookie bypass, `Vary`, conditional requests, and complete shared-cache freshness handling are not implemented. Responses are fully buffered before cache admission. |
+| Policy comparison | A primary hit does not fill a shadow miss; a primary miss can replace a shadow hit. Treat dashboard comparisons as exploratory, not an unbiased policy benchmark. |
+| RESP2 | The command dispatcher handles a small Redis-like subset, but the current reply encoder can fail to send replies. Keys share the HTTP namespace; binary-key handling, command validation, and expiration semantics are incomplete. This is not a Redis replacement. |
+| Prometheus | The recorder and endpoint exist, but application cache metrics and latency histograms are not wired up. Use `/api/stats` or `/ws/metrics` for current statistics. |
+| Lifecycle | Shutdown signals are handled, but full draining of active requests is not guaranteed. Configuration reloads have the limitations described above. |
+| Benchmarks | The Criterion target is a placeholder; it currently contains no measurements. |
+
+The HTTP admission path currently accepts GET/200 responses within the body-size
+limit and rejects basic `no-store`, `no-cache`, and `private` directives. It is not
+a complete [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111) cache implementation.
 
 ## Development
 
-### Prerequisites
-
-- [Rust](https://www.rust-lang.org/tools/install) 1.70+
-- [Node.js](https://nodejs.org/) 18+ (dashboard only)
-- [Docker](https://www.docker.com/) (for compose demo)
-
-### Commands
+Run these from the repository root:
 
 ```bash
-cargo build --workspace         # Build all crates
-cargo test --workspace          # Run all 48 tests
-cargo test -p colander-cache    # Cache library tests only
-cargo bench -p colander-cache   # SIEVE vs LRU throughput benchmarks
-cargo clippy --workspace        # Lint check
-cargo fmt --all                 # Format code
+cargo build --workspace
+cargo test --workspace
+cargo test -p colander-cache
+cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings -A dead_code
 ```
 
-### CI
+The formatting, Clippy, and workspace-test commands match the current
+[GitHub Actions workflow](.github/workflows/ci.yml). Test counts are intentionally
+not pinned in this README.
 
-Every push and pull request runs [GitHub Actions](.github/workflows/ci.yml):
+For the dashboard:
 
-1. `cargo fmt --all -- --check` — formatting
-2. `cargo clippy --workspace -- -D warnings` — lints (warnings are errors)
-3. `cargo test --workspace` — all tests
+```bash
+cd dashboard
+npm ci
+npm run lint
+npm run build
+```
 
-### Graceful Shutdown
+The current dashboard package has no test script, and its checks are not yet part
+of the Rust CI job. [`cache_bench.rs`](crates/colander-cache/benches/cache_bench.rs)
+is an empty Criterion harness; adding workloads there is needed before reporting
+repository benchmark numbers.
 
-On `SIGINT` (Ctrl+C) or `SIGTERM`:
+### Project map
 
-1. Stop accepting new connections on all servers (HTTP, metrics, RESP)
-2. Drain in-flight requests to completion
-3. Exit cleanly
+| Path | Start here for |
+| --- | --- |
+| [`crates/colander-cache/`](crates/colander-cache/) | Policies, arenas, sharding, and cache tests |
+| [`crates/proxy-server/`](crates/proxy-server/) | HTTP forwarding, configuration, protocols, and statistics |
+| [`crates/loadgen/`](crates/loadgen/) | Workload generation, pacing, and control API |
+| [`crates/demo-backend/`](crates/demo-backend/) | Synthetic origin and health endpoint |
+| [`dashboard/`](dashboard/) | React components, charts, and Vite proxy configuration |
+| [`docker/`](docker/) | Container builds and Docker-specific configuration |
+| [`docker-compose.yml`](docker-compose.yml) | Service wiring, published ports, and health checks |
 
-This ensures zero dropped requests during rolling deployments.
+## Troubleshooting
 
----
+| Symptom | Check |
+| --- | --- |
+| Docker services are not ready | Run `docker compose ps` and `docker compose logs --tail=100`. The first Rust build can take time. |
+| Address already in use | Stop the conflicting local service. For Compose, adjust host port mappings; changing container listen addresses also requires updating service routing. |
+| Proxy returns 502 | Check the origin's `/health`, `upstream.url`, and proxy logs. Local runs use `127.0.0.1`; Compose uses `backend`. |
+| Dashboard is disconnected | Check `/api/stats` on port 9090. Open the dashboard through its Vite or nginx server, rather than opening `index.html` directly. |
+| Alpha slider says offline | Start `loadgen` and check `/status` on port 9091. |
+| Two cache checks both hit | Use a fresh item ID or restart the proxy; the entry may already be cached. |
+| Node engine or install errors | Check `node --version` against the requirements above, then run `npm ci` in `dashboard/`. |
+| Redis hangs or Prometheus has no cache series | These are current implementation limitations; see [current scope](#current-scope). |
 
 ## References
 
-- [SIEVE is Simpler than LRU: an Efficient Turn-Key Eviction Algorithm for Web Caches](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo) — Yazhuo Zhang et al., NSDI '24
-- [SIEVE Project Page](https://cachemon.github.io/SIEVE-website/) — interactive visualizations and trace results
-- [Redis Serialization Protocol (RESP)](https://redis.io/docs/latest/develop/reference/protocol-spec/) — wire protocol specification
-- [Prometheus Exposition Formats](https://prometheus.io/docs/instrumenting/exposition_formats/) — metrics text format
-- [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111) — `Cache-Control` semantics
-
----
+- [SIEVE: NSDI ’24 paper, talk, and slides](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo)
+- [SIEVE project and trace results](https://cachemon.github.io/SIEVE-website/)
+- [HTTP caching specification, RFC 9111](https://www.rfc-editor.org/rfc/rfc9111)
+- [Redis serialization protocol](https://redis.io/docs/latest/develop/reference/protocol-spec/)
 
 ## License
 
-[MIT](LICENSE) &copy; 2026 KennyIgbechi
+[MIT](LICENSE) · Copyright 2026 KennyIgbechi
