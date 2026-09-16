@@ -21,11 +21,11 @@ struct Args {
     proxy_url: String,
 
     /// Number of unique items in the dataset
-    #[arg(long, default_value_t = 100_000)]
+    #[arg(long, default_value_t = 100_000, value_parser = clap::value_parser!(u64).range(1..))]
     num_items: u64,
 
     /// Number of concurrent request tasks
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u64).range(1..))]
     concurrency: u64,
 
     /// Target requests per second (0 = unlimited)
@@ -33,7 +33,7 @@ struct Args {
     rps: u64,
 
     /// Initial Zipfian alpha (skewness)
-    #[arg(long, default_value_t = 0.8)]
+    #[arg(long, default_value_t = 0.8, value_parser = parse_alpha)]
     alpha: f64,
 
     /// Control server listen address
@@ -52,6 +52,7 @@ struct LoadGenState {
     concurrency: u64,
     /// Total requests sent (atomic counter).
     total_requests: AtomicU64,
+    limiter: Option<RateLimiter>,
 }
 
 impl LoadGenState {
@@ -90,25 +91,54 @@ struct StatusResponse {
     rps: u64,
 }
 
+fn parse_alpha(value: &str) -> Result<f64, String> {
+    let alpha = value.parse::<f64>().map_err(|_| "alpha must be a number")?;
+    if !alpha.is_finite() || !(0.01..=3.0).contains(&alpha) {
+        return Err("alpha must be finite and between 0.01 and 3.0".into());
+    }
+    Ok(alpha)
+}
+
 async fn control_handler(
     State(state): State<Arc<LoadGenState>>,
     Json(body): Json<ControlRequest>,
-) -> Json<ControlResponse> {
+) -> Result<Json<ControlResponse>, (axum::http::StatusCode, String)> {
     if let Some(alpha) = body.alpha {
-        let clamped = alpha.clamp(0.01, 3.0);
-        state.set_alpha(clamped);
-        tracing::info!(alpha = clamped, "alpha updated");
+        parse_alpha(&alpha.to_string())
+            .map_err(|error| (axum::http::StatusCode::BAD_REQUEST, error))?;
+        state.set_alpha(alpha);
+        tracing::info!(alpha, "alpha updated");
     }
     if let Some(running) = body.running {
         state.running.store(running, Ordering::Relaxed);
-        tracing::info!(running, "running state updated");
     }
-
-    Json(ControlResponse {
+    Ok(Json(ControlResponse {
         alpha: state.alpha(),
         running: state.running.load(Ordering::Relaxed),
         total_requests: state.total_requests.load(Ordering::Relaxed),
-    })
+    }))
+}
+
+/// One shared schedule enforces the aggregate rate, even below worker count.
+struct RateLimiter {
+    next: tokio::sync::Mutex<tokio::time::Instant>,
+    period: Duration,
+}
+
+impl RateLimiter {
+    fn new(rps: u64) -> Option<Self> {
+        (rps > 0).then(|| Self {
+            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            period: Duration::from_secs_f64(1.0 / rps as f64).max(Duration::from_nanos(1)),
+        })
+    }
+
+    async fn wait(&self) {
+        let mut next = self.next.lock().await;
+        tokio::time::sleep_until(*next).await;
+        // Schedule from now: slow requests and pauses cannot accumulate burst credits.
+        *next = tokio::time::Instant::now() + self.period;
+    }
 }
 
 async fn status_handler(State(state): State<Arc<LoadGenState>>) -> Json<StatusResponse> {
@@ -124,17 +154,6 @@ async fn status_handler(State(state): State<Arc<LoadGenState>>) -> Json<StatusRe
 
 /// Worker task that sends requests to the proxy using a Zipfian distribution.
 async fn worker(state: Arc<LoadGenState>, client: Client, worker_id: u64) {
-    let delay = if state.rps > 0 {
-        let per_worker_rps = state.rps / state.concurrency.max(1);
-        if per_worker_rps > 0 {
-            Some(Duration::from_micros(1_000_000 / per_worker_rps))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     // Each worker gets its own generator (rand is not Send-safe across awaits with thread_rng)
     let mut gen = ZipfianGenerator::new(state.num_items, state.alpha());
 
@@ -144,9 +163,16 @@ async fn worker(state: Arc<LoadGenState>, client: Client, worker_id: u64) {
             continue;
         }
 
+        if let Some(limiter) = &state.limiter {
+            limiter.wait().await;
+            if !state.running.load(Ordering::Relaxed) {
+                continue;
+            }
+        }
+
         // Check if alpha changed and rebuild generator
         let current_alpha = state.alpha();
-        if (current_alpha - gen.alpha()).abs() > 0.001 {
+        if current_alpha != gen.alpha() {
             gen = ZipfianGenerator::new(state.num_items, current_alpha);
         }
 
@@ -154,8 +180,22 @@ async fn worker(state: Arc<LoadGenState>, client: Client, worker_id: u64) {
         let url = format!("{}/api/items/{}", state.proxy_url, item_id);
 
         match client.get(&url).send().await {
-            Ok(_resp) => {
-                state.total_requests.fetch_add(1, Ordering::Relaxed);
+            Ok(mut response) => {
+                // Drain the body so pooled connections can be reused. Count only
+                // complete requests, without allocating the whole response body.
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            state.total_requests.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "response body failed");
+                            break;
+                        }
+                    }
+                }
             }
             Err(e) => {
                 if worker_id == 0 {
@@ -163,10 +203,6 @@ async fn worker(state: Arc<LoadGenState>, client: Client, worker_id: u64) {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        }
-
-        if let Some(d) = delay {
-            tokio::time::sleep(d).await;
         }
     }
 }
@@ -189,6 +225,7 @@ async fn main() {
         rps: args.rps,
         concurrency: args.concurrency,
         total_requests: AtomicU64::new(0),
+        limiter: RateLimiter::new(args.rps),
     });
 
     // Build control server
@@ -258,5 +295,79 @@ async fn main() {
     // Wait for all workers (runs forever)
     for h in handles {
         let _ = h.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_cli_before_starting_workers() {
+        for args in [
+            vec!["loadgen", "--num-items=0"],
+            vec!["loadgen", "--concurrency=0"],
+            vec!["loadgen", "--alpha=NaN"],
+            vec!["loadgen", "--alpha=-1"],
+            vec!["loadgen", "--alpha=4"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+        assert!(Args::try_parse_from(["loadgen", "--rps=1", "--concurrency=16"]).is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aggregate_rate_is_bounded_below_concurrency() {
+        let limiter = Arc::new(RateLimiter::new(2).unwrap());
+        let start = tokio::time::Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let limiter = Arc::clone(&limiter);
+            tasks.push(tokio::spawn(async move {
+                limiter.wait().await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert!(start.elapsed() >= Duration::from_millis(7500));
+        assert!(start.elapsed() < Duration::from_secs(9));
+        assert!(RateLimiter::new(0).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_does_not_accumulate_burst_credit() {
+        let limiter = RateLimiter::new(10).unwrap();
+        limiter.wait().await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        limiter.wait().await;
+        let resumed = tokio::time::Instant::now();
+        limiter.wait().await;
+        assert!(resumed.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn invalid_control_is_rejected_without_partial_updates() {
+        let state = Arc::new(LoadGenState {
+            alpha_fp: AtomicU64::new(800),
+            num_items: 10,
+            running: AtomicBool::new(true),
+            proxy_url: String::new(),
+            rps: 0,
+            concurrency: 1,
+            total_requests: AtomicU64::new(0),
+            limiter: None,
+        });
+        let result = control_handler(
+            State(Arc::clone(&state)),
+            Json(ControlRequest {
+                alpha: Some(-1.0),
+                running: Some(false),
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(state.alpha(), 0.8);
+        assert!(state.running.load(Ordering::Relaxed));
     }
 }
