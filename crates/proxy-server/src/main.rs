@@ -114,6 +114,9 @@ async fn main() {
     let proxy_router = Router::new()
         .route("/{*path}", any(proxy_handler))
         .route("/", any(proxy_handler))
+        .layer(axum::Extension(proxy::UpstreamTimeout(
+            Duration::from_millis(config.upstream.timeout_ms),
+        )))
         .with_state(Arc::clone(&state));
 
     // Start both servers
