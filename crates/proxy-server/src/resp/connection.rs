@@ -7,15 +7,24 @@ use redis_protocol::resp2::types::BytesFrame;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+const MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
 /// Handle a single RESP client connection: read frames, dispatch commands, write responses.
 pub async fn handle_connection(mut stream: TcpStream, state: &AppState) {
     let mut buf = BytesMut::with_capacity(4096);
 
     loop {
-        // Read data from client
-        match stream.read_buf(&mut buf).await {
+        if buf.len() >= MAX_FRAME_SIZE {
+            let _ = stream
+                .write_all(b"-ERR frame exceeds 8 MiB limit\r\n")
+                .await;
+            return;
+        }
+        let mut chunk = [0u8; 8192];
+        let available = chunk.len().min(MAX_FRAME_SIZE - buf.len());
+        match stream.read(&mut chunk[..available]).await {
             Ok(0) => break, // EOF
-            Ok(_) => {}
+            Ok(read) => buf.extend_from_slice(&chunk[..read]),
             Err(e) => {
                 tracing::debug!(error = %e, "RESP read error");
                 break;
@@ -24,7 +33,7 @@ pub async fn handle_connection(mut stream: TcpStream, state: &AppState) {
 
         // Try to decode complete frames from the buffer
         loop {
-            // clone().freeze() gives us &Bytes without copying the data
+            // The decoder returns owned byte slices for dispatch.
             let (frame, consumed) = match decode_bytes(&buf.clone().freeze()) {
                 Ok(Some((frame, consumed))) => (frame, consumed),
                 Ok(None) => break, // Need more data
