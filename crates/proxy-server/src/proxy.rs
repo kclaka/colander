@@ -264,9 +264,9 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 
 fn request_is_cacheable(method: &Method, headers: &HeaderMap) -> bool {
     method == Method::GET
-        && !headers
+        && headers
             .get("content-length")
-            .is_some_and(|value| value != "0")
+            .is_none_or(|value| value == "0")
         && !headers.keys().any(|name| {
             matches!(
                 name.as_str(),
