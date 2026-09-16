@@ -229,18 +229,17 @@ The proxy reads `config.toml` from its **working directory**. Use the checked-in
 [local configuration](config.toml) as a starting point. Compose mounts
 [`docker/config.toml`](docker/config.toml), where the upstream hostname is `backend`.
 
-If no file exists, the proxy uses built-in defaults. A supplied file must include
-`[upstream]` and its `url`; parse/read failures currently fall back to defaults
-and are logged. These defaults are not identical to the checked-in file: for
-example, the file binds RESP to loopback, while built-in defaults bind it to all
-interfaces.
+If no file exists, the proxy uses built-in defaults. Omitted fields use defaults,
+but an existing invalid or unreadable file stops startup with an error. Built-in
+defaults are not identical to the checked-in file: for example, the file binds
+RESP to loopback, while built-in defaults bind it to all interfaces.
 
 | Setting | Checked-in local value | Meaning |
 | --- | --- | --- |
 | `server.listen_addr` | `0.0.0.0:8080` | HTTP listener |
 | `server.metrics_addr` | `0.0.0.0:9090` | Statistics, WebSocket, and admin listener |
 | `upstream.url` | `http://127.0.0.1:3000` | Origin; the current client uses HTTP |
-| `upstream.timeout_ms` | `5000` | Declared setting; currently not enforced |
+| `upstream.timeout_ms` | `5000` | Deadline for upstream headers and response-body reads |
 | `cache.capacity` | `10000` | Entry limit **per policy**, distributed across shards |
 | `cache.default_ttl_seconds` | `60` | Lifetime when a response supplies no parsed max-age |
 | `cache.max_body_size_bytes` | `1048576` | Largest body admitted to the HTTP cache (1 MiB) |
@@ -250,23 +249,27 @@ interfaces.
 | `resp.listen_addr` | `127.0.0.1:6379` | Local RESP bind address |
 
 In demo mode, each policy has its own entry capacity; `capacity` is not a byte
-budget. The body-size limit controls cache admission, not upstream response
-buffering. Set `resp.enabled = false` if you only need the HTTP demo.
+budget. Non-cacheable and oversized responses stream through; cache candidates are
+buffered only up to the body-size limit plus the current HTTP data frame.
+Set `resp.enabled = false` if you only need the HTTP demo.
 
 ### Reloading configuration
 
-The watcher attempts to apply TTL and policy changes at runtime. A default-TTL
+The watcher applies default-TTL and policy changes at runtime. A default-TTL
 change affects newly inserted entries, not existing entries. A policy change
-rebuilds the caches and clears their data and counters.
+rebuilds the caches and clears their data and counters while preserving the
+active demo/bench mode.
 
-For predictable behavior, restart after changing capacity, body limits, listener
-addresses, or upstream settings. The current watcher does not reliably handle
-atomic file replacement, and ignored settings can interact with later policy
-reloads. Check startup/reload logs to confirm the configuration being used.
+Capacity, body limits, upstream settings, and listener settings require a restart.
+Reloads retain their active values and log a warning when these settings change.
+Invalid reloads leave the active configuration and cache intact. The watcher
+handles editor atomic replacements and a configuration file created after startup.
+
+On shutdown, the HTTP proxy and metrics server both wait for their active
+requests to drain.
 
 The demo/admin listeners have no authentication, and Compose publishes their
-ports on the host. Run the demo on a trusted local machine; the current HTTP
-cache does not isolate authenticated or personalized traffic.
+ports on the host. Run the demo on a trusted local machine.
 
 ## API
 
@@ -294,6 +297,33 @@ Locally generated upstream-error responses do not necessarily include them.
 For response fields, see [`PolicyMetrics` and `MetricsSnapshot`](crates/proxy-server/src/metrics.rs).
 A `hit_rate` is a fraction from 0 to 1; the dashboard displays a percentage.
 
+### Redis protocol subset
+
+The RESP2 listener supports a small cache-oriented command set:
+
+| Command | Behavior |
+| --- | --- |
+| `PING [message]` | Return `PONG` or echo the message |
+| `GET key` | Return a value or nil |
+| `SET key value [EX seconds \| PX milliseconds]` | Store a value with an optional positive TTL; without EX/PX, it remains until eviction or deletion |
+| `DEL key [key ...]` | Return the number of live entries deleted |
+| `TTL key` | Return seconds remaining, `-1` for no expiration, or `-2` for a missing key |
+
+Unsupported commands and options return errors, including `EXPIRE`, `COMMAND`,
+and `SET ... NX`. RESP and HTTP use separate key namespaces within the same
+bounded primary cache. RESP operations do not update the comparison cache.
+Values are limited by `max_body_size_bytes`; incoming frames are limited to 8 MiB.
+
+With `redis-cli` installed and RESP enabled:
+
+```bash
+redis-cli -p 6379 PING
+redis-cli -p 6379 SET demo-key hello EX 60
+redis-cli -p 6379 GET demo-key
+redis-cli -p 6379 TTL demo-key
+redis-cli -p 6379 DEL demo-key
+```
+
 ## Current scope
 
 The HTTP demo, cache policies, load controls, and JSON/WebSocket statistics are
@@ -301,16 +331,17 @@ implemented. The following boundaries describe the code on this branch:
 
 | Area | Current limitation |
 | --- | --- |
-| HTTP forwarding and caching | Request headers are not forwarded. Credential/cookie bypass, `Vary`, conditional requests, and complete shared-cache freshness handling are not implemented. Responses are fully buffered before cache admission. |
+| HTTP forwarding and caching | Conservatively bypasses personalized, conditional, range, and `Vary` traffic. Variant-aware storage, validators, full age calculations, related-resource invalidation, and stale revalidation are not implemented. See [HTTP caching behavior](docs/http-caching.md). |
 | Policy comparison | A primary hit does not fill a shadow miss; a primary miss can replace a shadow hit. Treat dashboard comparisons as exploratory, not an unbiased policy benchmark. |
-| RESP2 | The command dispatcher handles a small Redis-like subset, but the current reply encoder can fail to send replies. Keys share the HTTP namespace; binary-key handling, command validation, and expiration semantics are incomplete. This is not a Redis replacement. |
+| RESP2 | Supports the [command subset](#redis-protocol-subset), with binary-safe keys isolated from HTTP entries. General Redis command compatibility and persistence are not implemented. |
 | Prometheus | The recorder and endpoint exist, but application cache metrics and latency histograms are not wired up. Use `/api/stats` or `/ws/metrics` for current statistics. |
-| Lifecycle | Shutdown signals are handled, but full draining of active requests is not guaranteed. Configuration reloads have the limitations described above. |
 | Benchmarks | The Criterion target is a placeholder; it currently contains no measurements. |
 
-The HTTP admission path currently accepts GET/200 responses within the body-size
-limit and rejects basic `no-store`, `no-cache`, and `private` directives. It is not
-a complete [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111) cache implementation.
+Eligible GET/200 responses can be cached within the body-size limit. Request
+headers are forwarded with hop-by-hop fields removed. Credentials, cookies,
+request cache directives, and response freshness rules determine whether caching
+is safe; see the [full admission rules](docs/http-caching.md). This remains a
+conservative subset of [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111).
 
 ## Development
 
@@ -334,13 +365,14 @@ For the dashboard:
 cd dashboard
 npm ci
 npm run lint
+npm test
 npm run build
 ```
 
-The current dashboard package has no test script, and its checks are not yet part
-of the Rust CI job. [`cache_bench.rs`](crates/colander-cache/benches/cache_bench.rs)
-is an empty Criterion harness; adding workloads there is needed before reporting
-repository benchmark numbers.
+The dashboard lint, Vitest, and build checks also run in GitHub Actions.
+[`cache_bench.rs`](crates/colander-cache/benches/cache_bench.rs) is an empty
+Criterion harness; adding workloads there is needed before reporting repository
+benchmark numbers.
 
 ### Project map
 
@@ -365,7 +397,8 @@ repository benchmark numbers.
 | Alpha slider says offline | Start `loadgen` and check `/status` on port 9091. |
 | Two cache checks both hit | Use a fresh item ID or restart the proxy; the entry may already be cached. |
 | Node engine or install errors | Check `node --version` against the requirements above, then run `npm ci` in `dashboard/`. |
-| Redis hangs or Prometheus has no cache series | These are current implementation limitations; see [current scope](#current-scope). |
+| Redis command returns an error | Check the [supported command subset](#redis-protocol-subset); options such as `NX` and commands such as `EXPIRE` are unsupported. |
+| Prometheus has no cache series | Application instruments are not wired up yet; use `/api/stats` or `/ws/metrics`. |
 
 ## References
 

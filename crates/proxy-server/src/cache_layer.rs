@@ -9,6 +9,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+fn raw_key(key: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut encoded = String::from("\0resp:");
+    for byte in key {
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
 /// Runtime mode for the dual-cache system.
 /// - Demo: updates both caches, serves from primary (fair hit-rate comparison)
 /// - Bench: updates only primary cache (true latency/throughput)
@@ -156,28 +165,39 @@ impl CacheLayer {
         self.primary.insert(key, value);
     }
 
-    /// Remove a key from the primary cache. Returns true if the key existed.
-    pub fn remove(&self, key: &str) -> bool {
-        self.primary.remove(key)
+    /// RESP keys are binary-safe and isolated from HTTP cache keys.
+    pub fn get_raw(&self, key: &[u8]) -> Option<Arc<CachedResponse>> {
+        self.primary.get(&raw_key(key))
     }
 
-    /// Insert raw bytes (for RESP SET — bypasses HTTP response wrapping).
-    /// Only inserts into primary (RESP ops don't participate in demo comparison).
-    pub fn insert_raw(&self, key: String, value: Bytes, ttl: Option<Duration>) {
+    pub fn remove_raw(&self, key: &[u8]) -> bool {
+        let key = raw_key(key);
+        // Expired entries count as absent, as they do for GET.
+        self.primary.get(&key).is_some() && self.primary.remove(&key)
+    }
+
+    /// SET without an expiration is persistent until eviction or deletion.
+    pub fn insert_raw(&self, key: &[u8], value: Bytes, ttl: Option<Duration>) {
         let response = CachedResponse {
             status: 0,
             headers: vec![],
             body: value,
             inserted_at: Instant::now(),
-            ttl: ttl.unwrap_or(self.default_ttl()),
+            ttl: ttl.unwrap_or(Duration::MAX),
         };
-        self.primary.insert(key, response);
+        self.primary.insert(raw_key(key), response);
     }
 
-    /// Get TTL remaining for a key. Returns None if key missing/expired.
-    pub fn ttl_remaining(&self, key: &str) -> Option<Duration> {
-        let entry = self.primary.get(key)?;
-        entry.ttl.checked_sub(entry.inserted_at.elapsed())
+    pub fn raw_ttl(&self, key: &[u8]) -> i64 {
+        match self.get_raw(key) {
+            None => -2,
+            Some(entry) if entry.ttl == Duration::MAX => -1,
+            Some(entry) => entry
+                .ttl
+                .saturating_sub(entry.inserted_at.elapsed())
+                .as_secs()
+                .min(i64::MAX as u64) as i64,
+        }
     }
 
     /// Build a CachedResponse from raw HTTP response parts.
@@ -194,6 +214,14 @@ impl CacheLayer {
             body,
             inserted_at: Instant::now(),
             ttl: ttl.unwrap_or(self.default_ttl()),
+        }
+    }
+
+    /// Invalidate both policy copies after a successful HTTP mutation.
+    pub fn invalidate_http(&self, key: &str) {
+        self.primary.remove(key);
+        if let Some(comparison) = &self.comparison {
+            comparison.remove(key);
         }
     }
 
@@ -251,22 +279,34 @@ pub fn parse_cache_control(value: &str) -> CacheControl {
         max_age: None,
     };
 
-    for directive in value.split(',').map(|s| s.trim().to_lowercase()) {
-        if directive == "no-store" || directive == "no-cache" || directive == "private" {
+    let mut max_age = None;
+    let mut shared_max_age = None;
+    for directive in value.split(',') {
+        let (name, argument) = directive
+            .trim()
+            .split_once('=')
+            .map_or((directive.trim(), None), |(name, value)| {
+                (name.trim(), Some(value.trim().trim_matches('"')))
+            });
+        if ["no-store", "no-cache", "private"]
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        {
             result.cacheable = false;
         }
-        if let Some(age) = directive.strip_prefix("max-age=") {
-            if let Ok(secs) = age.trim().parse::<u64>() {
-                result.max_age = Some(Duration::from_secs(secs));
-            }
-        }
-        if let Some(age) = directive.strip_prefix("s-maxage=") {
-            if let Ok(secs) = age.trim().parse::<u64>() {
-                // s-maxage takes precedence for shared caches
-                result.max_age = Some(Duration::from_secs(secs));
+        if name.eq_ignore_ascii_case("max-age") || name.eq_ignore_ascii_case("s-maxage") {
+            let target = if name.eq_ignore_ascii_case("s-maxage") {
+                &mut shared_max_age
+            } else {
+                &mut max_age
+            };
+            match argument.and_then(|value| value.parse::<u64>().ok()) {
+                Some(seconds) if target.is_none() => *target = Some(Duration::from_secs(seconds)),
+                _ => result.cacheable = false, // Invalid or duplicate freshness is unsafe to reuse.
             }
         }
     }
+    result.max_age = shared_max_age.or(max_age);
 
     result
 }
