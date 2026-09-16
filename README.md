@@ -158,7 +158,7 @@ redis-cli -p 6379 GET foo                   # "bar"
 
 ## Configuration
 
-Colander reads from `config.toml` in the working directory. All fields have defaults — the file is optional.
+Colander reads from `config.toml` in the working directory. All fields have defaults — the file is optional. An existing invalid file is rejected at startup rather than silently replaced with defaults.
 
 ### Server
 
@@ -203,7 +203,11 @@ Colander watches `config.toml` for changes at runtime. When a change is detected
 |-------|----------|----------|
 | `default_ttl_seconds` | Applied immediately via atomic swap | **None** — cache data preserved |
 | `eviction_policy` / `comparison_policy` | Cache rebuilt with new policy | Cache cleared (cold start) |
-| `capacity` | **Ignored** — logged as WARN | Restart required |
+| `capacity`, `max_body_size_bytes`, upstream and listen settings | **Ignored** — active values retained and logged as WARN | Restart required |
+
+Policy changes preserve the active demo/bench mode. Invalid reloads leave the current
+configuration and cache intact. The parent directory is watched so editor atomic
+replacements and a configuration file created after startup are detected.
 
 > **Why capacity changes are rejected**: If a running cache is full (e.g., 1M items) and capacity drops to 500K, the next request would synchronously evict 500K items in a tight loop, stalling the event loop and spiking P99 latency. Colander prioritizes stability over flexibility — restart to resize safely.
 
