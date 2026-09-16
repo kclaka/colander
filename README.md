@@ -59,7 +59,7 @@ Traditional caches use **LRU**, which moves every accessed item to the front of 
 
 | Property | LRU | SIEVE |
 |----------|-----|-------|
-| Hit operation | Move-to-front (write lock) | Flip visited bit (lock-free `AtomicBool`) |
+| Hit operation | Move-to-front (write lock) | Flip atomic visited bit (shard write lock) |
 | Eviction | Always evict tail | Hand scans for unvisited |
 | Miss ratio | Baseline | [Up to 63% lower](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo) than ARC |
 | Multi-thread scaling | Limited by write contention | Near-linear to 16+ threads |
@@ -111,7 +111,7 @@ Read the full paper: [*SIEVE is Simpler than LRU: an Efficient Turn-Key Eviction
 | **Protocols** | HTTP reverse proxy (`:8080`) + [RESP2 Redis interface](#redis-interface-resp2) (`:6379`) |
 | **Observability** | [Prometheus metrics](#prometheus-metrics) (`:9090/metrics`), WebSocket live stream, [React dashboard](#live-dashboard) |
 | **Operability** | [Graceful shutdown](#graceful-shutdown) (SIGINT/SIGTERM), [config hot-reload](#hot-reload), per-policy stats |
-| **Performance** | 64-shard concurrency, arena-allocated linked lists, lock-free hits (SIEVE), `ahash` for DoS-resistant sharding |
+| **Performance** | Up to 64 shards, arena-allocated linked lists, atomic visited bits (SIEVE), `ahash` for DoS-resistant sharding |
 | **DevOps** | Docker Compose one-click demo, [GitHub Actions CI](#development) (fmt + clippy + test) |
 
 ---
@@ -370,12 +370,14 @@ All policies use an **arena-allocated doubly-linked list** ([`arena.rs`](crates/
 
 ### 64-Shard Concurrency
 
-[`ShardedCache<T>`](crates/colander-cache/src/sharded.rs) distributes keys across **64 independent shards** via [`ahash`](https://crates.io/crates/ahash):
+[`ShardedCache<T>`](crates/colander-cache/src/sharded.rs) distributes keys across **up to 64 independent shards** via [`ahash`](https://crates.io/crates/ahash):
 
 - Each shard has its own `parking_lot::RwLock`, arena, and eviction state
 - On a cache hit, only **1 of 64 shards** is locked
 - Shard selection: `ahash(key) & 0x3F` (bitmask for constant-time modulo)
-- SIEVE hits need only a read lock (the visited bit is `AtomicBool`)
+- All current policy lookups acquire a shard write lock to maintain statistics and remove expired entries. SIEVE avoids LRU list promotion, but is not lock-free.
+- Small caches use fewer shards; remaining slots are distributed so aggregate capacity exactly matches configuration.
+- The random shard hash is shared across policies for comparable key placement.
 
 ### Lazy TTL Expiration
 
