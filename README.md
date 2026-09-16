@@ -11,7 +11,7 @@
 
 ---
 
-Colander is a drop-in caching reverse proxy that replaces LRU with the [SIEVE](https://cachemon.github.io/SIEVE-website/) eviction algorithm (published at [NSDI '24](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo)). It sits between your clients and your backend, caches HTTP responses, and speaks both **HTTP** and the **Redis wire protocol (RESP2)** — so you can swap out Redis for SIEVE-powered caching with zero code changes.
+Colander is a drop-in caching reverse proxy that replaces LRU with the [SIEVE](https://cachemon.github.io/SIEVE-website/) eviction algorithm (published at [NSDI '24](https://www.usenix.org/conference/nsdi24/presentation/zhang-yazhuo)). It sits between your clients and your backend, caches HTTP responses, and speaks both **HTTP** and the **Redis wire protocol (RESP2)** — with a small Redis-compatible command subset for cache workloads.
 
 ```bash
 docker compose up          # proxy + backend + load generator + dashboard
@@ -158,7 +158,7 @@ redis-cli -p 6379 GET foo                   # "bar"
 
 ## Configuration
 
-Colander reads from `config.toml` in the working directory. All fields have defaults — the file is optional.
+Colander reads from `config.toml` in the working directory. All fields have defaults — the file is optional. An existing invalid file is rejected at startup rather than silently replaced with defaults.
 
 ### Server
 
@@ -203,7 +203,11 @@ Colander watches `config.toml` for changes at runtime. When a change is detected
 |-------|----------|----------|
 | `default_ttl_seconds` | Applied immediately via atomic swap | **None** — cache data preserved |
 | `eviction_policy` / `comparison_policy` | Cache rebuilt with new policy | Cache cleared (cold start) |
-| `capacity` | **Ignored** — logged as WARN | Restart required |
+| `capacity`, `max_body_size_bytes`, upstream and listen settings | **Ignored** — active values retained and logged as WARN | Restart required |
+
+Policy changes preserve the active demo/bench mode. Invalid reloads leave the current
+configuration and cache intact. The parent directory is watched so editor atomic
+replacements and a configuration file created after startup are detected.
 
 > **Why capacity changes are rejected**: If a running cache is full (e.g., 1M items) and capacity drops to 500K, the next request would synchronously evict 500K items in a tight loop, stalling the event loop and spiking P99 latency. Colander prioritizes stability over flexibility — restart to resize safely.
 
@@ -223,10 +227,10 @@ redis-cli -p 6379
 |---------|--------|-------------|
 | **PING** | `PING` | Health check. Returns `PONG`. |
 | **GET** | `GET key` | Retrieve a cached value. Returns bulk string or `(nil)`. |
-| **SET** | `SET key value [EX seconds]` | Store a value with optional TTL. Returns `OK`. |
+| **SET** | `SET key value [EX seconds | PX milliseconds]` | Store a value with optional positive TTL. Without EX/PX, it persists until eviction or deletion. Unsupported options return an error. |
 | **DEL** | `DEL key [key ...]` | Delete one or more keys. Returns count of deleted keys. |
-| **TTL** | `TTL key` | Seconds remaining before expiry. Returns `-2` if key missing. |
-| **EXPIRE** | `EXPIRE key seconds` | Not supported (TTL is set-at-insert). Returns `0`. |
+| **TTL** | `TTL key` | Seconds remaining before expiry. Returns `-2` if key missing and `-1` if it has no expiration. |
+| **EXPIRE** | `EXPIRE key seconds` | Not supported (TTL is set-at-insert). Returns an explicit error. |
 | **COMMAND** | `COMMAND` | Client compatibility (redis-cli sends this on connect). Returns `OK`. |
 
 ### Example
@@ -245,7 +249,7 @@ OK
 (nil)
 ```
 
-> **Shared cache**: The RESP interface shares the same in-memory cache as the HTTP proxy. A `SET` via Redis is visible to HTTP `GET` responses, and vice versa.
+> **Isolated keys**: RESP and HTTP use separate key namespaces within the same bounded primary cache. Binary Redis keys cannot overwrite HTTP responses. RESP operations do not update the comparison cache. Values are limited by `max_body_size_bytes`; incoming frames are limited to 8 MiB.
 
 ---
 

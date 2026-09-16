@@ -42,8 +42,8 @@ async fn main() {
                 c
             }
             Err(e) => {
-                tracing::error!(error = %e, "failed to load config.toml, using defaults");
-                Config::default_config()
+                tracing::error!(error = %e, "failed to load config.toml");
+                std::process::exit(1)
             }
         }
     } else {
@@ -114,6 +114,9 @@ async fn main() {
     let proxy_router = Router::new()
         .route("/{*path}", any(proxy_handler))
         .route("/", any(proxy_handler))
+        .layer(axum::Extension(proxy::UpstreamTimeout(
+            Duration::from_millis(config.upstream.timeout_ms),
+        )))
         .with_state(Arc::clone(&state));
 
     // Start both servers
@@ -150,7 +153,8 @@ async fn main() {
     }
 
     // Spawn config file watcher
-    spawn_config_watcher(PathBuf::from("config.toml"), config, Arc::clone(&state));
+    let _config_watcher =
+        spawn_config_watcher(PathBuf::from("config.toml"), config, Arc::clone(&state));
 
     // Spawn shutdown signal handler
     let shutdown_clone = shutdown.clone();
@@ -162,23 +166,30 @@ async fn main() {
     let proxy_shutdown = shutdown.clone();
     let metrics_shutdown = shutdown.clone();
 
-    let proxy_future = axum::serve(proxy_listener, proxy_router)
-        .with_graceful_shutdown(proxy_shutdown.cancelled_owned());
+    let proxy_stop = shutdown.clone();
+    let proxy_future = async move {
+        let result = axum::serve(proxy_listener, proxy_router)
+            .with_graceful_shutdown(proxy_shutdown.cancelled_owned())
+            .await;
+        proxy_stop.cancel();
+        result
+    };
+    let metrics_future = async move {
+        let result = axum::serve(metrics_listener, metrics_router)
+            .with_graceful_shutdown(metrics_shutdown.cancelled_owned())
+            .await;
+        shutdown.cancel();
+        result
+    };
 
-    let metrics_future = axum::serve(metrics_listener, metrics_router)
-        .with_graceful_shutdown(metrics_shutdown.cancelled_owned());
-
-    tokio::select! {
-        result = proxy_future => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "proxy server error");
-            }
-        }
-        result = metrics_future => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "metrics server error");
-            }
-        }
+    // Wait for both drains. Selecting the first completed server would drop the
+    // other server's active HTTP requests as soon as the idle metrics server exits.
+    let (proxy_result, metrics_result) = tokio::join!(proxy_future, metrics_future);
+    if let Err(error) = proxy_result {
+        tracing::error!(%error, "proxy server error");
+    }
+    if let Err(error) = metrics_result {
+        tracing::error!(%error, "metrics server error");
     }
 
     tracing::info!("colander proxy shut down");
@@ -208,18 +219,24 @@ async fn shutdown_signal(token: CancellationToken) {
 }
 
 /// Spawn a filesystem watcher on config.toml that applies safe config changes at runtime.
-fn spawn_config_watcher(config_path: PathBuf, initial_config: Config, state: Arc<AppState>) {
+fn spawn_config_watcher(
+    config_path: PathBuf,
+    initial_config: Config,
+    state: Arc<AppState>,
+) -> Option<notify::RecommendedWatcher> {
+    let config_path = std::env::current_dir().ok()?.join(config_path);
     let current_config = Arc::new(Mutex::new(initial_config));
 
     let config_path_clone = config_path.clone();
     let mut watcher = match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
-            if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+            if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+                && event.paths.iter().any(|path| path == &config_path_clone)
+            {
                 match Config::load(&config_path_clone) {
                     Ok(new_config) => {
                         let mut old = current_config.lock();
-                        config::diff_and_apply(&old, &new_config, &state.cache);
-                        *old = new_config;
+                        *old = config::diff_and_apply(&old, &new_config, &state.cache);
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "failed to reload config.toml");
@@ -231,16 +248,15 @@ fn spawn_config_watcher(config_path: PathBuf, initial_config: Config, state: Arc
         Ok(w) => w,
         Err(e) => {
             tracing::warn!(error = %e, "failed to start config watcher");
-            return;
+            return None;
         }
     };
 
-    if let Err(e) = watcher.watch(&config_path, RecursiveMode::NonRecursive) {
+    if let Err(e) = watcher.watch(config_path.parent()?, RecursiveMode::NonRecursive) {
         tracing::warn!(error = %e, "failed to watch config.toml");
-        return;
+        return None;
     }
 
-    // Leak the watcher so it lives for the process lifetime
-    std::mem::forget(watcher);
     tracing::info!("config file watcher started");
+    Some(watcher)
 }
